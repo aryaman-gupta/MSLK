@@ -55,6 +55,10 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "bf16i4bf16_rowwise(Tensor X, Tensor W, Tensor w_scale_group, Tensor w_zero_group) -> Tensor");
   m.def(
       "bf16i4bf16_rowwise_batched(Tensor X, Tensor WQ, Tensor w_scale, Tensor w_zp) -> Tensor");
+  // INT8 GEMM via Triton — static and dynamic scale variants.
+  m.def("i8i8bf16(Tensor XQ, Tensor WQ, float scale, int split_k=1) -> Tensor");
+  m.def(
+      "i8i8bf16_dynamic(Tensor XQ, Tensor WQ, Tensor scale, int split_k=1) -> Tensor");
 #else
   m.def("i8i8bf16(Tensor XQ, Tensor WQ, float scale, int split_k=1) -> Tensor");
   m.def(
@@ -127,6 +131,11 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8f16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8bf16_rowwise_grouped_mm", f8f8bf16_rowwise_grouped_mm);
+  // i8i8bf16 / i8i8bf16_dynamic: dispatched to Python Triton kernels via
+  // torch.library.impl registered in mslk/gemm/triton/int8_gemm.py.
+  // IMPORTANT: int8_gemm.py must be imported before these ops are called;
+  // the Python-side @torch.library.impl("mslk::i8i8bf16_dynamic", "CUDA")
+  // registration only takes effect after that import.
 #else
   m.impl("f8f8bf16_groupwise", f8f8bf16_groupwise);
   m.impl("f8f8bf16_groupwise_grouped", f8f8bf16_groupwise_grouped);
@@ -181,6 +190,8 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8f16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8bf16_rowwise_grouped_mm", f8f8bf16_rowwise_grouped_mm);
+  // i8i8bf16 / i8i8bf16_dynamic: Python Triton dispatch; no CPU fallback
+  // needed.
 #else
   m.impl("f8f8bf16_groupwise", f8f8bf16_groupwise);
   m.impl("f8f8bf16_groupwise_grouped", f8f8bf16_groupwise_grouped);
