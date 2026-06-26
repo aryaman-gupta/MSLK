@@ -50,7 +50,6 @@ try:
 except ImportError:
     pass
 
-
 # Device gating for the GEMM kernels exercised in this file uses the shared skip
 # decorators from mslk.testing.device: the strict platform gates
 # skipUnlessCuda / skipUnlessRocm, refined by skipUnlessCudaCapability,
@@ -2181,6 +2180,7 @@ class NVFP4Tests(unittest.TestCase):
 
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=5.0e-2)
 
+    # NVFP4 grouped GEMM is CUDA-only (TCGen5-swizzled layout + CUTLASS kernel).
     @parameterized.expand(
         [
             (1, 256, 256, 2048),  # small
@@ -2365,7 +2365,7 @@ class NVFP4Tests(unittest.TestCase):
         self.assertEqual(out.device.type, "meta")
 
 
-@skipUnlessCuda()
+@skipUnlessGfxArch("gfx950")
 @skipUnlessCudaCapability(10)
 class MXFP4Tests(unittest.TestCase):
     @classmethod
@@ -2453,8 +2453,68 @@ class MXFP4Tests(unittest.TestCase):
             (1, 256, 256, 2048),  # small
             (4, 500, 1024, 2048),  # medium
             (16, 3500, 6144, 3584),  # large
+            (3, None, 512, 2048),  # uneven: m_sizes_list=[64, 232, 600]
         ]
     )
+    def test_grouped_stacked_gemm(
+        self,
+        G: int,
+        M,  # int for even case, None for uneven case
+        N: int,
+        K: int,
+    ) -> None:
+        """f4f4bf16_grouped_stacked uses per-expert M sizes, not offsets."""
+        if M is None:
+            m_sizes_list = [64, 232, 600]
+            assert len(m_sizes_list) == G
+        else:
+            m_sizes_list = [M] * G
+
+        XS = [
+            torch.randn((m, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for m in m_sizes_list
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        M_sizes = torch.tensor(m_sizes_list, dtype=torch.int64, device=self.device)
+
+        xqs, wqs, x_scales, w_scales = [], [], [], []
+        for x, w in zip(XS, WS):
+            xq, x_scale = triton_quantize_mx4_unpack(x)
+            wq, w_scale = triton_quantize_mx4_unpack(w)
+            xqs.append(xq)
+            wqs.append(wq)
+            x_scales.append(x_scale)
+            w_scales.append(w_scale)
+
+        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)
+        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)
+        x_scale = torch.cat(x_scales, dim=0).view(torch.float8_e8m0fnu)
+        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e8m0fnu)
+
+        X = torch.cat(XS, dim=0)
+        W = torch.stack(WS, dim=0)
+        offsets_for_ref = torch.cumsum(M_sizes, dim=0).to(torch.int32)
+        out_bf16 = torch._grouped_mm(
+            X, W.transpose(-2, -1), offs=offsets_for_ref, out_dtype=torch.bfloat16
+        )
+
+        out_mxfp4 = torch.ops.mslk.f4f4bf16_grouped_stacked(
+            xq, wq, x_scale, w_scale, M_sizes
+        )
+        self.assertTrue(out_mxfp4.isfinite().all(), "output contains non-finite values")
+        torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
+
+    @parameterized.expand(
+        [
+            (1, 256, 256, 2048),  # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
+        ]
+    )
+    @skipUnlessCuda()
     def test_grouped_gemm_2d_2d(
         self,
         G: int,
