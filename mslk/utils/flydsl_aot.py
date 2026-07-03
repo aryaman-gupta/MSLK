@@ -24,6 +24,7 @@ attributes:
 """
 
 import importlib
+import multiprocessing as mp
 import os
 from concurrent.futures import as_completed, ProcessPoolExecutor
 from contextlib import contextmanager
@@ -109,8 +110,12 @@ def compile_aot(cache_dir: str) -> None:
     )
 
     errors: List[str] = []
+    # Use spawn: workers compile FlyDSL kernels which touch CUDA, and forking
+    # a parent that has already initialized CUDA breaks re-initialization.
     with _compile_only_env(cache_dir):
-        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        with ProcessPoolExecutor(
+            max_workers=max_workers, mp_context=mp.get_context("spawn")
+        ) as pool:
             futures = {
                 pool.submit(_compile_one, module_path, config, arch): (
                     module_path,
