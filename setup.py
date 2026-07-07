@@ -694,8 +694,12 @@ def main(argv: List[str]) -> None:
     # where cu126 changes to match the cuda version..
     extras_require = {
         "flash3": ["flash-attn-3"],
-        "flydsl": ["flydsl==0.2.2"],
     }
+
+    # FlyDSL is a ROCm-only backend; also offered on variant-agnostic
+    # python-only builds.
+    if _PYTHON_ONLY or build.variant() == "rocm":
+        extras_require["flydsl"] = ["flydsl==0.2.2"]
 
     packages = setuptools.find_packages()
 
