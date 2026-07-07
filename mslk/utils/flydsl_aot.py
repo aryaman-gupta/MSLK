@@ -34,7 +34,9 @@ from mslk.utils.flydsl import _BUNDLED_AOT_CACHE
 
 # Module paths of AOT-eligible FlyDSL kernel modules. Each must expose
 # AOT_CONFIGS, AOT_ARCHS, and compile_aot_config(config, arch).
-_AOT_KERNEL_MODULES: List[str] = []
+_AOT_KERNEL_MODULES: List[str] = [
+    "mslk.gemm.flydsl.tiled_mma",
+]
 
 _DEFAULT_MAX_WORKERS: int = 64
 

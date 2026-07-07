@@ -35,3 +35,8 @@ if torch.version.hip is not None:
     # so that torch.ops.mslk.mx8mx4bf16/_grouped dispatches to the Triton
     # kernel on AMD.
     from .triton import mx8mx4_gemm  # noqa: F401
+
+    from mslk.utils.flydsl import is_flydsl_available
+
+    if is_flydsl_available():
+        from .flydsl import tiled_mma  # noqa: F401
