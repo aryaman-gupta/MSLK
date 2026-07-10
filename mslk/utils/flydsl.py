@@ -53,8 +53,10 @@ def require_flydsl() -> None:
 
 # Bundled AOT cache shipped inside the package (populated at build time).
 # Shared across all FlyDSL kernel categories (gemm, moe, ...), so it lives
-# alongside the FlyDSL support module rather than under any kernel domain.
-_BUNDLED_AOT_CACHE: str = os.path.join(os.path.dirname(__file__), "flydsl_aot_cache")
+# under a dedicated mslk.flydsl package rather than under any kernel domain.
+_BUNDLED_AOT_CACHE: str = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "flydsl", "aot_artifacts"
+)
 
 
 def configure_runtime_cache() -> None:

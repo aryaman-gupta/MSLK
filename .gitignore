@@ -8,4 +8,4 @@ mslk/version.py
 **/__pycache__
 **/*.so
 *.profraw
-mslk/utils/flydsl_aot_cache/
+mslk/flydsl/aot_artifacts/
