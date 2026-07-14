@@ -40,3 +40,9 @@ if torch.version.hip is not None:
         mx8mx4_gemm,
         mx8mx8_gemm,
     )
+
+    from mslk.utils.flydsl import is_flydsl_available
+
+    if is_flydsl_available():
+        # Registers mslk::f8f8bf16_groupwise_grouped_preshuffle (FlyDSL).
+        from .flydsl import fp8_groupwise_grouped_gemm as _flydsl_groupwise_grouped
