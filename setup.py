@@ -45,7 +45,22 @@ logging.basicConfig(level=logging.INFO)
 
 
 def _detect_build_variant() -> str:
-    """Auto-detect the build variant based on the installed PyTorch."""
+    """Auto-detect the build variant (cpu/cuda/rocm).
+
+    Uses CU_VERSION when set (the CI signal), otherwise introspects the
+    installed PyTorch. Torch is imported lazily so this also works in
+    python-only source installs, where torch is present in the environment
+    but not imported at module load; it degrades to cpu when torch is absent.
+    """
+    cu_version = os.environ.get("CU_VERSION", "")
+    if cu_version.startswith("rocm"):
+        return "rocm"
+    if cu_version.startswith("cu"):
+        return "cuda"
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
     if torch.version.hip is not None:
         return "rocm"
     if torch.version.cuda is not None:
@@ -712,13 +727,6 @@ def main(argv: List[str]) -> None:
         "flash3": ["flash-attn-3"],
     }
 
-    # FlyDSL is a ROCm-only backend. On native ROCm builds the variant is
-    # known at build time, so it is a hard requirement (injected into
-    # install_requires below). Python-only builds are variant-agnostic, so it
-    # remains an opt-in extra there.
-    if _PYTHON_ONLY:
-        extras_require["flydsl"] = [f"flydsl=={_flydsl_version()}"]
-
     packages = setuptools.find_packages()
 
     # When building with FB code in python-only mode, include fb/ packages
@@ -756,11 +764,11 @@ def main(argv: List[str]) -> None:
             # nightly and test packages
             "numpy",
         ]
-        # FlyDSL is a mandatory ROCm-only backend. On native builds the variant
-        # is known, so require it directly.
+        # FlyDSL is a mandatory ROCm-only backend.
         + (
             [f"flydsl=={_flydsl_version()}"]
-            if not _PYTHON_ONLY and build.variant() == "rocm"
+            if (build.variant() if not _PYTHON_ONLY else _detect_build_variant())
+            == "rocm"
             else []
         ),
         extras_require=extras_require,

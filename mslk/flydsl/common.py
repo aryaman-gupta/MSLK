@@ -8,10 +8,10 @@
 
 """Shared FlyDSL helpers used by both the JIT and AOT paths.
 
-FlyDSL is an optional ROCm-only backend (install with ``pip install
-mslk[flydsl]``). These helpers detect availability and locate the bundled
-cache; they are kernel-agnostic and independent of whether kernels are
-compiled just-in-time or ahead-of-time.
+FlyDSL is a ROCm-only backend, required on ROCm builds and absent
+elsewhere. These helpers detect availability and locate the bundled cache;
+they are kernel-agnostic and independent of whether kernels are compiled
+just-in-time or ahead-of-time.
 """
 
 import functools
@@ -20,7 +20,7 @@ import os
 
 _INSTALL_HINT: str = (
     "FlyDSL is required for this kernel but is not available. "
-    "Install it with `pip install mslk[flydsl]`."
+    "Install it with `pip install flydsl`."
 )
 
 # Bundled AOT cache shipped inside the package (populated at build time).
