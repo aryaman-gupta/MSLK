@@ -45,6 +45,8 @@ CompileConstants = namedtuple(
         "a_load_bytes",
         "chunk_i32_a",
         "num_a_loads",
+        "chunk_i32_b",
+        "num_b_loads",
     ],
 )
 
@@ -62,6 +64,34 @@ def validate_params(*, n, k, tile_n, tile_k, scale_block_k, scale_block_n, out_d
         raise ValueError(f"tile_n ({tile_n}) must be divisible by scale_block_n ({scale_block_n})")
     if out_dtype not in ("bf16", "f16"):
         raise ValueError(f"out_dtype must be 'bf16' or 'f16', got {out_dtype!r}")
+
+
+# gfx950 has 64 KiB of LDS per workgroup.
+_LDS_CAPACITY_BYTES = 64 * 1024
+
+
+def validate_lds_budget_plain(*, tile_m, tile_n, tile_k, elem_bytes=1, b_pingpong=False):
+    """Check the plain-B kernel's LDS budget fits in one workgroup's LDS.
+
+    The plain-B kernel stages BOTH A (ping-pong) and B through LDS during the
+    K-loop, so they coexist; the epilogue output aliases that same arena (it
+    runs after the final barrier). Budget = max(K-loop staging, epilogue out).
+    Raises ValueError if a tile config would overflow LDS.
+    """
+    lds_a_bytes = 2 * tile_m * tile_k * elem_bytes  # ping-pong A
+    b_buffers = 2 if b_pingpong else 1
+    lds_b_bytes = b_buffers * tile_n * tile_k * elem_bytes
+    lds_out_bytes = tile_m * tile_n * 2  # bf16/f16 epilogue output, aliases base
+    kloop_bytes = lds_a_bytes + lds_b_bytes
+    total = max(kloop_bytes, lds_out_bytes)
+    if total > _LDS_CAPACITY_BYTES:
+        raise ValueError(
+            f"plain-B LDS budget {total} bytes exceeds {_LDS_CAPACITY_BYTES} "
+            f"(A ping-pong {lds_a_bytes} + B {lds_b_bytes} = {kloop_bytes}, "
+            f"epilogue {lds_out_bytes}) for tile_m={tile_m} tile_n={tile_n} "
+            f"tile_k={tile_k} b_pingpong={b_pingpong}. Reduce tile_n/tile_k or "
+            f"disable b_pingpong."
+        )
 
 
 def out_mlir_for(out_dtype):
@@ -93,6 +123,13 @@ def compute_compile_constants(*, n, k, tile_m, tile_n, tile_k, scale_block_k, sc
     chunk_i32_a = a_load_bytes // 4  # 4 dwords per load
     num_a_loads = bytes_per_thread_a // a_load_bytes
 
+    # Plain-B staging (non-preshuffle kernel): B tile is [tile_n, tile_k],
+    # loaded HBM->LDS just like A but with N in place of M.
+    bytes_b_per_tile = tile_n * tile_k * elem_bytes
+    bytes_per_thread_b = bytes_b_per_tile // total_threads
+    chunk_i32_b = a_load_bytes // 4  # same 16-byte dwordx4 load
+    num_b_loads = bytes_per_thread_b // a_load_bytes
+
     return CompileConstants(
         total_threads=total_threads,
         elem_bytes=elem_bytes,
@@ -109,6 +146,8 @@ def compute_compile_constants(*, n, k, tile_m, tile_n, tile_k, scale_block_k, sc
         a_load_bytes=a_load_bytes,
         chunk_i32_a=chunk_i32_a,
         num_a_loads=num_a_loads,
+        chunk_i32_b=chunk_i32_b,
+        num_b_loads=num_b_loads,
     )
 
 
@@ -128,6 +167,35 @@ def setup_lds_allocation(*, allocator, tile_m, tile_k, tile_n, elem_bytes):
     allocator.ptr = lds_alloc_offset + lds_total_bytes
     lds_tile_elems = tile_m * tile_k  # element offset between ping and pong
     return lds_alloc_offset, lds_tile_elems
+
+
+def setup_lds_allocation_plain(*, allocator, tile_m, tile_n, tile_k, elem_bytes, b_pingpong=False):
+    """Reserve LDS for the plain-B kernel: ping-pong A + (single/ping-pong) B +
+    aliased CShuffle epilogue output.
+
+    Unlike the preshuffle kernel (which loads B straight to registers and needs
+    no B LDS), plain B is staged HBM->LDS->registers alongside A, so A and B
+    LDS coexist during the K-loop. The epilogue output aliases the whole arena
+    (offset 0) since it runs after the final K-loop barrier.
+
+    Returns `(lds_alloc_offset, lds_tile_elems, lds_b_offset_elems)` where:
+      - `lds_alloc_offset` is the byte base of the arena (A ping half at 0),
+      - `lds_tile_elems` is the A ping<->pong element stride (= tile_m*tile_k),
+      - `lds_b_offset_elems` is the element offset (from arena base) to the B
+        buffer, i.e. just past the A ping-pong region.
+    """
+    lds_a_elems = tile_m * tile_k
+    lds_a_pingpong_elems = 2 * lds_a_elems
+    b_buffers = 2 if b_pingpong else 1
+    lds_b_elems = b_buffers * tile_n * tile_k
+    kloop_elems = lds_a_pingpong_elems + lds_b_elems  # FP8: 1 byte/elem
+    lds_out_bytes = tile_m * tile_n * 2
+    lds_total_bytes = max(kloop_elems * elem_bytes, lds_out_bytes)
+    lds_alloc_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_alloc_offset + lds_total_bytes
+    lds_tile_elems = lds_a_elems
+    lds_b_offset_elems = lds_a_pingpong_elems
+    return lds_alloc_offset, lds_tile_elems, lds_b_offset_elems
 
 
 def make_a_tile_loaders(
@@ -219,6 +287,91 @@ def make_a_tile_loaders(
     return prefetch_a_tile, store_a_tile_to_lds, a_row_local, a_col_local_i32, k_blocks16
 
 
+def make_b_tile_loaders(
+    *,
+    b_rsrc,
+    lds_b,
+    layout_lds_b,
+    by_n,
+    group_idx,
+    tx,
+    tile_n,
+    tile_k,
+    tile_k_bytes,
+    tile_k_dwords,
+    chunk_i32_b,
+    num_b_loads,
+    total_threads,
+    elem_bytes,
+    n_in,
+    k_in,
+):
+    """Build the prefetch + LDS-store closures for a PLAIN (non-preshuffled)
+    B tile [tile_n, tile_k].
+
+    Mirror of `make_a_tile_loaders` with N in place of M. B is `[G, N, K]`
+    row-major, so the per-tile global base adds the group offset
+    `group_idx * n_in * (k_in/4)` (always present — B is always grouped) plus
+    the N-tile base `by_n` (the block's N-block start). Coalesced 16-byte
+    (dwordx4) loads via `tile_chunk_coord_i32`; LDS store uses the same XOR16
+    swizzle as A. Returns `(prefetch_b_tile, store_b_tile_to_lds, b_row_local,
+    b_col_local_i32, k_blocks16_b)`.
+    """
+    layout_b_tile_div4 = fx.make_layout((tile_n, tile_k_dwords), stride=(tile_k_dwords, 1))
+    c_chunk_b = fx.Index(chunk_i32_b)
+    tx_i32_base = tx * c_chunk_b
+    _k_div4_factor = k_in // fx.Index(4)
+    # B is [G, N, K]: leading offset selects this tile's group and N-block base.
+    b_tile_offset_div4 = group_idx * n_in * _k_div4_factor
+    k_blocks16_b = arith.index(tile_k_bytes // 16)
+    c4_bytes = fx.Index(4)
+
+    b_row_local = []
+    b_col_local_i32 = []
+    for i in range_constexpr(num_b_loads):
+        row_local, col_local_i32 = tile_chunk_coord_i32(
+            arith,
+            tx_i32_base=tx_i32_base,
+            i=i,
+            total_threads=total_threads,
+            layout_tile_div4=layout_b_tile_div4,
+            chunk_i32=chunk_i32_b,
+        )
+        b_row_local.append(row_local)
+        b_col_local_i32.append(col_local_i32)
+
+    def prefetch_b_tile(k_tile_idx_py):
+        """Load plain B tile from global memory into VGPRs (coalesced dwordx4)."""
+        base_k_div4 = fx.Index(k_tile_idx_py * tile_k_dwords)
+        parts = []
+        for i in range_constexpr(num_b_loads):
+            row_global = by_n + b_row_local[i]  # global N row
+            idx_i32 = b_tile_offset_div4 + row_global * _k_div4_factor + base_k_div4 + b_col_local_i32[i]
+            b_vec = buffer_ops.buffer_load(b_rsrc, idx_i32, vec_width=4, dtype=T.i32)
+            parts.append(Vector(b_vec).bitcast(fx.Int32))
+        return parts
+
+    def store_b_tile_to_lds(b_parts, lds_base):
+        """Write prefetched B tile from VGPRs into LDS with XOR16 swizzle."""
+        for i in range_constexpr(num_b_loads):
+            lds_store_16b_xor16(
+                arith,
+                vector,
+                lds_memref=lds_b,
+                vec16_ty=T.f8x16,
+                layout_lds=layout_lds_b,
+                row_local=b_row_local[i],
+                col_local_i32=b_col_local_i32[i],
+                tx_c4=c4_bytes,
+                k_blocks16=k_blocks16_b,
+                lds_base=lds_base,
+                vec_part_i32x4=b_parts[i],
+                elem_bytes=elem_bytes,
+            )
+
+    return prefetch_b_tile, store_b_tile_to_lds, b_row_local, b_col_local_i32, k_blocks16_b
+
+
 def make_lds_loader(*, lds_a, layout_lds, k_blocks16):
     """Build the LDS-side A K64 pack loader.
 
@@ -235,6 +388,66 @@ def make_lds_loader(*, lds_a, layout_lds, k_blocks16):
         return a_i64x2[0], a_i64x2[1]
 
     return lds_load_packs_k64
+
+
+def make_lds_b_loader(*, lds_b, layout_lds_b, k_blocks16_b):
+    """Build the LDS-side plain-B K64 pack loader (mirror of `make_lds_loader`).
+
+    Returns `lds_load_b_packs_k64(row_n_lds, col_base_bytes, lds_base_b)` which
+    loads 16B from the B LDS buffer with the same XOR16 swizzle A uses and
+    returns the two i64 halves — the exact fragment form the MFMA consumes for
+    the B operand.
+    """
+
+    def lds_load_b_packs_k64(row_n_lds, col_base_bytes, lds_base_b):
+        col_base_swz_bytes = swizzle_xor16(row_n_lds, col_base_bytes, k_blocks16_b)
+        idx_b16 = crd2idx((row_n_lds, col_base_swz_bytes), layout_lds_b) + lds_base_b
+        loaded_b16 = Vector.load(T.vec(16, T.f8), lds_b, [idx_b16])
+        b_i64x2 = loaded_b16.bitcast(fx.Int64)
+        return b_i64x2[0], b_i64x2[1]
+
+    return lds_load_b_packs_k64
+
+
+def make_plain_b_tile(
+    *, lds_load_b_packs_k64, lane_mod_16, n_tile_base, col_offset_base_bytes, k_unroll, num_acc_n
+):
+    """Build the plain-B tile assembler that reads B from LDS (mirror of the
+    preshuffle `make_b_loader`, but sourcing from LDS instead of HBM).
+
+    Returns `load_b_tile_from_lds(lds_base_b)` producing the SAME structure the
+    preshuffle path did — a list of length `k_unroll` where each entry is
+    `(packs0[ni], packs1[ni])` (two i64 halves per K64 micro-step, per N-acc) —
+    so `make_compute_tile` consumes it unchanged.
+
+    N-row addressing must match what the MFMA B operand expects, i.e. the same
+    N-column `make_n_block_coords` uses (common.py):
+        col = by_n + n_tile_base + ni*16 + lane_mod_16
+    where `n_tile_base = wave_mod_4 * n_per_wave` is this WAVE's N sub-range.
+    Since the B LDS buffer holds the block's [tile_n, tile_k] tile (row 0 = the
+    block's `by_n`), the LDS N-row for accumulator `ni` is the tile-LOCAL row
+    `n_tile_base + ni*16 + lane_mod_16` (by_n is the tile base, already 0 in the
+    LDS-local frame). Missing `n_tile_base` gives the wrong N per wave.
+
+    K addressing mirrors A exactly: per-pack column base is
+    `col_offset_base_bytes + ku*64` (`col_offset_base_bytes = lane_div_16*16`).
+    """
+
+    def load_b_tile_from_lds(lds_base_b):
+        b_tile = []
+        for ku in range_constexpr(k_unroll):
+            col_base_bytes = col_offset_base_bytes + fx.Index(ku * 64)
+            packs0 = []
+            packs1 = []
+            for ni in range_constexpr(num_acc_n):
+                row_n_lds = n_tile_base + (ni * 16) + lane_mod_16
+                b0, b1 = lds_load_b_packs_k64(row_n_lds, col_base_bytes, lds_base_b)
+                packs0.append(b0)
+                packs1.append(b1)
+            b_tile.append((packs0, packs1))
+        return b_tile
+
+    return load_b_tile_from_lds
 
 
 def make_b_loader(
@@ -404,6 +617,7 @@ def make_prefetch_scales(
 def make_compute_tile(
     *,
     _use_hw_scale,
+    _is_gfx950=False,
     lds_load_packs_k64,
     sa_rsrc,
     sb_rsrc,
@@ -505,6 +719,56 @@ def make_compute_tile(
                             mfma_res_ty,
                             [a128, b128, current_accs[acc_idx], 0, 0, 0, sa_e8m0_list[mi], 0, sb_e8m0_list[ni]],
                         )
+            elif _is_gfx950:
+                # Fast SW path (gfx950): use the wide 16x16x128 MFMA with a
+                # neutral E8M0 scale (0x7F7F7F7F = no-op HW scaling), accumulate
+                # a whole scale-block into block_accs, then apply the FP32 scales
+                # in software once per scale-block. Mirrors the working
+                # blockscale_preshuffle_gemm kernel. This avoids the 4x-narrower
+                # 16x16x32 MFMA and the per-K-step VALU scale tax below.
+                combined_scales = []
+                for mi in range_constexpr(m_repeat):
+                    mi_combined = []
+                    for ni in range_constexpr(num_acc_n):
+                        s_b_bc = Vector.filled((4,), fx.Float32(s_b_vals[ni]), fx.Float32)
+                        mi_combined.append(ArithValue(s_a_vecs[mi]) * ArithValue(s_b_bc))
+                    combined_scales.append(mi_combined)
+
+                block_accs = [acc_init] * (num_acc_n * m_repeat)
+                ku0 = sb * ku_per_sb
+                ku1 = ku0 + 1
+                b0_packs0, b0_packs1 = b_tile_in[ku0]
+                b1_packs0, b1_packs1 = b_tile_in[ku1]
+                col_base0 = col_offset_base_bytes + fx.Index(ku0 * 64)
+                col_base1 = col_offset_base_bytes + fx.Index(ku1 * 64)
+
+                for mi in range_constexpr(m_repeat):
+                    curr_row_a_lds = lane_mod_16 + (mi * 16)
+                    if a0_prefetch is not None and sb == 0 and mi == 0:
+                        a0, a1 = a0_prefetch
+                    else:
+                        a0, a1 = lds_load_packs_k64(curr_row_a_lds, col_base0, lds_base)
+                    a2, a3 = lds_load_packs_k64(curr_row_a_lds, col_base1, lds_base)
+                    a128 = pack_i64x4_to_i32x8(a0, a1, a2, a3)
+
+                    for ni in range_constexpr(num_acc_n):
+                        b128 = pack_i64x4_to_i32x8(
+                            b0_packs0[ni], b0_packs1[ni], b1_packs0[ni], b1_packs1[ni]
+                        )
+                        acc_idx = mi * num_acc_n + ni
+                        block_accs[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                            mfma_res_ty,
+                            [a128, b128, block_accs[acc_idx], 0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F],
+                        )
+
+                for mi in range_constexpr(m_repeat):
+                    for ni in range_constexpr(num_acc_n):
+                        acc_idx = mi * num_acc_n + ni
+                        current_accs[acc_idx] = math_dialect.fma(
+                            block_accs[acc_idx],
+                            combined_scales[mi][ni],
+                            current_accs[acc_idx],
+                        )
             else:
                 for ku_local in range_constexpr(ku_per_sb):
                     ku = sb * ku_per_sb + ku_local
@@ -534,6 +798,64 @@ def make_compute_tile(
         return current_accs
 
     return compute_tile
+
+
+def make_kloop_plain(
+    *,
+    num_k_tiles,
+    tile_k,
+    prefetch_a_tile,
+    store_a_tile_to_lds,
+    prefetch_b_tile,
+    store_b_tile_to_lds,
+    load_b_tile_from_lds,
+    prefetch_scales,
+    compute_tile,
+    lds_base_pong,
+    lds_base_b,
+):
+    """Simple (non-ping-pong) K-loop for the plain-B kernel.
+
+    Plain B is staged HBM->LDS->registers each K-tile, alongside A. This variant
+    prioritizes CORRECTNESS: single A buffer + single B buffer, one barrier
+    separating the HBM->LDS stores from the LDS->register reads per K-tile. It
+    deliberately forgoes the ping-pong overlap of `make_pingpong_kloop` — that
+    overlap is a perf optimization to restore once the plain-B fragment mapping
+    is validated. `lds_base_pong` is reused as the single A buffer base.
+    """
+
+    def run_kloop(accs):
+        if num_k_tiles == 0:
+            return accs
+
+        # Software-pipelined, single-LDS-buffer variant: the NEXT K-tile's A/B
+        # HBM loads (VGPR prefetch) are issued BEFORE computing the current tile,
+        # so global-load latency overlaps the current tile's MFMAs. LDS stays
+        # single-buffered (fits the LDS budget even at wide tile_n, unlike a
+        # double-buffered LDS ping-pong), at the cost of one barrier per tile to
+        # separate the compute-read from the next store.
+        a_regs = prefetch_a_tile(0)
+        b_regs = prefetch_b_tile(0)
+        for kt in range_constexpr(num_k_tiles):
+            # Publish this tile's A/B (already in VGPRs) to LDS.
+            store_a_tile_to_lds(a_regs, lds_base_pong)
+            store_b_tile_to_lds(b_regs, lds_base_b)
+            scales_pf = prefetch_scales(kt)
+            gpu.barrier()
+
+            # Issue next tile's HBM loads NOW so they overlap the compute below.
+            if kt + 1 < num_k_tiles:
+                a_regs = prefetch_a_tile(kt + 1)
+                b_regs = prefetch_b_tile(kt + 1)
+
+            # Read B fragment from LDS, compute the tile.
+            b_tile = load_b_tile_from_lds(lds_base_b)
+            accs = compute_tile(accs, kt, lds_base_pong, b_tile, scales_pf)
+            # Barrier before next iter overwrites the shared A/B buffers.
+            gpu.barrier()
+        return accs
+
+    return run_kloop
 
 
 def make_pingpong_kloop(
