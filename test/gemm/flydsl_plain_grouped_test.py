@@ -19,8 +19,8 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA/ROCm not available.", allow_module_level=True)
 
-from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_plain import (
-    compile_grouped_gemm_blockscale_plain,
+from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_contiguous import (
+    compile_grouped_gemm_blockscale_contiguous,
 )
 from mslk.gemm.flydsl.fp8_groupwise_grouped_gemm import _build_tile_map
 from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_group
@@ -51,10 +51,11 @@ def _run(m_values, N, K, tile_n=128, tile_k=128):
     )
 
     d = torch.zeros(TotalM, N, dtype=torch.bfloat16, device=device)
-    launch_fn = compile_grouped_gemm_blockscale_plain(
+    launch_fn = compile_grouped_gemm_blockscale_contiguous(
         n=N, k=K, num_groups=G,
         tile_m=_TILE_M, tile_n=tile_n, tile_k=tile_k,
         scale_block_k=128, scale_block_n=128, out_dtype="bf16",
+        b_preshuffled=False,
     )
     launch_fn(
         d.view(-1),
