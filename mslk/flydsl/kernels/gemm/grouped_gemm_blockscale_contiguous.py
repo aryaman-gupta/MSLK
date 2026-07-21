@@ -35,7 +35,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
@@ -45,15 +45,21 @@ from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
     init_accumulators,
     make_a_tile_loaders,
     make_b_loader,
+    make_b_tile_loaders,
     make_compute_tile,
     make_epilogue_writers,
     make_hot_loop_scheduler,
+    make_kloop_plain,
+    make_lds_b_loader,
     make_lds_loader,
     make_n_block_coords,
     make_pingpong_kloop,
+    make_plain_b_tile,
     make_prefetch_scales,
     out_mlir_for,
     setup_lds_allocation,
+    setup_lds_allocation_plain,
+    validate_lds_budget_plain,
     validate_params,
 )
 from mslk.flydsl.kernels.mma.mfma_epilogues import mfma_epilog
@@ -72,6 +78,7 @@ def compile_grouped_gemm_blockscale_contiguous(
     scale_block_n: int = 128,
     out_dtype: str = "bf16",
     waves_per_eu: int | None = None,
+    b_preshuffled: bool = True,
 ):
     """Compile grouped FP8 GEMM kernel and return the JIT launcher.
 
@@ -85,6 +92,12 @@ def compile_grouped_gemm_blockscale_contiguous(
         scale_block_k: K-dimension scale block size (default 128)
         scale_block_n: N-dimension scale block size (default 128)
         out_dtype: Output data type ("bf16" or "f16")
+        b_preshuffled: When True (default) B is expected pre-swizzled into the
+            MFMA layout and loaded HBM->registers (no B LDS). When False, B is
+            plain row-major [num_groups, N, K] and is staged HBM->LDS->registers
+            like A. The two paths share the entire kernel body (tile-map group
+            dispatch, FP32 block scaling, wide-MFMA, CShuffle epilogue); only the
+            B load stage and its LDS allocation differ.
 
     Returns:
         JIT launcher function.
@@ -93,8 +106,13 @@ def compile_grouped_gemm_blockscale_contiguous(
     # This FP8 kernel always uses the FP32 software-scaling path; the shared
     # helpers' hardware E8M0 microscaling path is not used here.
     _use_hw_scale = False
+    # On gfx950 the SW path still uses the wide 16x16x128 MFMA with a neutral
+    # E8M0 scale (no-op HW scaling) and applies FP32 scales in software; gfx942
+    # lacks that instruction and falls back to the narrow 16x16x32 path.
+    _is_gfx950 = str(gpu_arch).startswith("gfx95")
 
-    allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem_grouped_gemm")
+    _sym = "smem_grouped_gemm" if b_preshuffled else "smem_grouped_gemm_plain"
+    allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name=_sym)
 
     validate_params(
         n=n,
@@ -105,6 +123,9 @@ def compile_grouped_gemm_blockscale_contiguous(
         scale_block_n=scale_block_n,
         out_dtype=out_dtype,
     )
+    if not b_preshuffled:
+        # Plain B needs its own LDS buffer alongside A — enforce the byte budget.
+        validate_lds_budget_plain(tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, b_pingpong=False)
     out_mlir = out_mlir_for(out_dtype)
 
     _c = compute_compile_constants(
@@ -128,21 +149,34 @@ def compile_grouped_gemm_blockscale_contiguous(
     tile_k_dwords = _c.tile_k_dwords
     chunk_i32_a = _c.chunk_i32_a
     num_a_loads = _c.num_a_loads
+    chunk_i32_b = _c.chunk_i32_b
+    num_b_loads = _c.num_b_loads
 
-    lds_alloc_offset, lds_tile_elems = setup_lds_allocation(
-        allocator=allocator,
-        tile_m=tile_m,
-        tile_k=tile_k,
-        tile_n=tile_n,
-        elem_bytes=elem_bytes,
-    )
+    if b_preshuffled:
+        lds_alloc_offset, lds_tile_elems = setup_lds_allocation(
+            allocator=allocator,
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
+            elem_bytes=elem_bytes,
+        )
+        lds_b_offset_elems = None
+    else:
+        lds_alloc_offset, lds_tile_elems, lds_b_offset_elems = setup_lds_allocation_plain(
+            allocator=allocator,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            elem_bytes=elem_bytes,
+            b_pingpong=False,
+        )
 
     # Module name for caching
+    _variant = "contiguous_pingpong" if b_preshuffled else "plain"
     module_name = (
-        f"grouped_gemm_blockscale_contiguous_{out_dtype}"
+        f"grouped_gemm_blockscale_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_pingpong"
     ).replace("-", "_")
 
     @flyc.kernel(name=module_name)
@@ -187,7 +221,8 @@ def compile_grouped_gemm_blockscale_contiguous(
         lane_div_16 = fx.get(coord_lane16, 0)
         lane_mod_16 = fx.get(coord_lane16, 1)
 
-        # LDS setup: single memref for both ping-pong buffers
+        # LDS setup: ping-pong A buffers (preshuffle) or A ping-pong + single B
+        # buffer (plain). B LDS is only needed for the plain path.
         base_ptr = allocator.get_base()
         lds_a = SmemPtr(base_ptr, lds_alloc_offset, T.f8, shape=(2 * tile_m * tile_k,)).get()
         lds_stride = tile_k
@@ -195,7 +230,15 @@ def compile_grouped_gemm_blockscale_contiguous(
         lds_base_pong = fx.Index(0)
         lds_base_ping = fx.Index(lds_tile_elems)
 
-        # CShuffle epilogue LDS (aliased from same base, bf16 element type)
+        if const_expr(not b_preshuffled):
+            # Plain-B LDS buffer, placed just past the A ping-pong region.
+            lds_b = SmemPtr(
+                base_ptr, lds_alloc_offset, T.f8, shape=((lds_b_offset_elems + tile_n * tile_k),)
+            ).get()
+            layout_lds_b = fx.make_layout((tile_n, tile_k), stride=(tile_k, 1))
+            lds_base_b = fx.Index(lds_b_offset_elems)
+
+        # CShuffle epilogue LDS (aliased from same base, out-dtype element type)
         lds_out = SmemPtr(base_ptr, lds_alloc_offset, out_mlir(), shape=(tile_m * tile_n,)).get()
 
         # Buffer resources
@@ -294,37 +337,74 @@ def compile_grouped_gemm_blockscale_contiguous(
                 k_blocks16=k_blocks16,
             )
 
-            load_b_tile = make_b_loader(
-                arg_b=arg_b,
-                b_rsrc=b_rsrc,
-                layout_b=layout_b,
-                n_blk_list=n_blk_list,
-                n_intra_list=n_intra_list,
-                lane_div_16=lane_div_16,
-                kpack_bytes=kpack_bytes,
-                elem_bytes=elem_bytes,
-                k_unroll=k_unroll,
-                num_acc_n=num_acc_n,
-            )
-
             # Base coordinates for A0 prefetch (mi=0, ku=0)
             row_a_lds_base = lane_mod_16  # mi=0
             col_offset_base_bytes = lane_div_16 * fx.Index(16)  # ku=0
+
+            # ---- B load path: preshuffled (HBM->registers) vs plain (HBM->LDS->registers) ----
+            if const_expr(b_preshuffled):
+                load_b_tile = make_b_loader(
+                    arg_b=arg_b,
+                    b_rsrc=b_rsrc,
+                    layout_b=layout_b,
+                    n_blk_list=n_blk_list,
+                    n_intra_list=n_intra_list,
+                    lane_div_16=lane_div_16,
+                    kpack_bytes=kpack_bytes,
+                    elem_bytes=elem_bytes,
+                    k_unroll=k_unroll,
+                    num_acc_n=num_acc_n,
+                )
+            else:
+                prefetch_b_tile, store_b_tile_to_lds, _b_row_local, _b_col_local_i32, k_blocks16_b = (
+                    make_b_tile_loaders(
+                        b_rsrc=b_rsrc,
+                        lds_b=lds_b,
+                        layout_lds_b=layout_lds_b,
+                        by_n=by_n,
+                        group_idx=group_idx,
+                        tx=tx,
+                        tile_n=tile_n,
+                        tile_k=tile_k,
+                        tile_k_bytes=tile_k_bytes,
+                        tile_k_dwords=tile_k_dwords,
+                        chunk_i32_b=chunk_i32_b,
+                        num_b_loads=num_b_loads,
+                        total_threads=total_threads,
+                        elem_bytes=elem_bytes,
+                        n_in=n_in,
+                        k_in=k_in,
+                    )
+                )
+                lds_load_b_packs_k64 = make_lds_b_loader(
+                    lds_b=lds_b,
+                    layout_lds_b=layout_lds_b,
+                    k_blocks16_b=k_blocks16_b,
+                )
+                load_b_tile_from_lds = make_plain_b_tile(
+                    lds_load_b_packs_k64=lds_load_b_packs_k64,
+                    lane_mod_16=lane_mod_16,
+                    n_tile_base=n_tile_base,
+                    col_offset_base_bytes=col_offset_base_bytes,
+                    k_unroll=k_unroll,
+                    num_acc_n=num_acc_n,
+                )
 
             mfma_res_ty = T.f32x4
 
             ku_per_sb = scale_block_k // 64
             rocdl.sched_barrier(0)
 
-            hot_loop_scheduler = make_hot_loop_scheduler(
-                _use_hw_scale=_use_hw_scale,
-                sb_per_tile=sb_per_tile,
-                m_repeat=m_repeat,
-                num_acc_n=num_acc_n,
-                k_unroll=k_unroll,
-                num_a_loads=num_a_loads,
-                ku_per_sb=ku_per_sb,
-            )
+            if const_expr(b_preshuffled):
+                hot_loop_scheduler = make_hot_loop_scheduler(
+                    _use_hw_scale=_use_hw_scale,
+                    sb_per_tile=sb_per_tile,
+                    m_repeat=m_repeat,
+                    num_acc_n=num_acc_n,
+                    k_unroll=k_unroll,
+                    num_a_loads=num_a_loads,
+                    ku_per_sb=ku_per_sb,
+                )
 
             prefetch_scales = make_prefetch_scales(
                 _use_hw_scale=_use_hw_scale,
@@ -345,6 +425,7 @@ def compile_grouped_gemm_blockscale_contiguous(
 
             compute_tile = make_compute_tile(
                 _use_hw_scale=_use_hw_scale,
+                _is_gfx950=_is_gfx950,
                 lds_load_packs_k64=lds_load_packs_k64,
                 sa_rsrc=sa_rsrc,
                 sb_rsrc=sb_rsrc,
@@ -366,21 +447,36 @@ def compile_grouped_gemm_blockscale_contiguous(
                 acc_init=acc_init,
             )
 
-            run_kloop = make_pingpong_kloop(
-                num_k_tiles=num_k_tiles,
-                tile_k=tile_k,
-                prefetch_a_tile=prefetch_a_tile,
-                store_a_tile_to_lds=store_a_tile_to_lds,
-                load_b_tile=load_b_tile,
-                prefetch_scales=prefetch_scales,
-                compute_tile=compute_tile,
-                hot_loop_scheduler=hot_loop_scheduler,
-                lds_load_packs_k64=lds_load_packs_k64,
-                lds_base_pong=lds_base_pong,
-                lds_base_ping=lds_base_ping,
-                row_a_lds_base=row_a_lds_base,
-                col_offset_base_bytes=col_offset_base_bytes,
-            )
+            if const_expr(b_preshuffled):
+                run_kloop = make_pingpong_kloop(
+                    num_k_tiles=num_k_tiles,
+                    tile_k=tile_k,
+                    prefetch_a_tile=prefetch_a_tile,
+                    store_a_tile_to_lds=store_a_tile_to_lds,
+                    load_b_tile=load_b_tile,
+                    prefetch_scales=prefetch_scales,
+                    compute_tile=compute_tile,
+                    hot_loop_scheduler=hot_loop_scheduler,
+                    lds_load_packs_k64=lds_load_packs_k64,
+                    lds_base_pong=lds_base_pong,
+                    lds_base_ping=lds_base_ping,
+                    row_a_lds_base=row_a_lds_base,
+                    col_offset_base_bytes=col_offset_base_bytes,
+                )
+            else:
+                run_kloop = make_kloop_plain(
+                    num_k_tiles=num_k_tiles,
+                    tile_k=tile_k,
+                    prefetch_a_tile=prefetch_a_tile,
+                    store_a_tile_to_lds=store_a_tile_to_lds,
+                    prefetch_b_tile=prefetch_b_tile,
+                    store_b_tile_to_lds=store_b_tile_to_lds,
+                    load_b_tile_from_lds=load_b_tile_from_lds,
+                    prefetch_scales=prefetch_scales,
+                    compute_tile=compute_tile,
+                    lds_base_pong=lds_base_pong,
+                    lds_base_b=lds_base_b,
+                )
             accs = run_kloop(accs)
 
             # ===== Epilogue: CShuffle vectorized stores =====
