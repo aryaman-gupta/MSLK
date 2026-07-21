@@ -167,6 +167,81 @@ def matmul_f8f8bf16_groupwise_grouped_preshuffle(
     return output
 
 
+def matmul_f8f8bf16_groupwise_grouped(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    M_sizes: torch.Tensor,
+) -> torch.Tensor:
+    """Plain (non-preshuffled) grouped groupwise FP8 GEMM via FlyDSL.
+
+    Same contract as the preshuffle sibling but WQ is plain row-major [G, N, K]
+    (not MFMA-preshuffled) — the drop-in FlyDSL replacement for the Triton impl
+    of ``mslk::f8f8bf16_groupwise_grouped``. Uses the unified kernel with
+    ``b_preshuffled=False`` (B staged HBM->LDS->registers).
+    """
+    from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_contiguous import (
+        compile_grouped_gemm_blockscale_contiguous,
+    )
+
+    assert XQ.ndim == 2, f"XQ must be [TotalM, K], got {XQ.shape}"
+    assert WQ.ndim == 3, f"WQ must be [G, N, K], got {WQ.shape}"
+    TotalM, K = XQ.shape
+    G, N, Kw = WQ.shape
+    assert Kw == K, f"K mismatch: XQ K={K}, WQ K={Kw}"
+    assert N % _TILE_N == 0, f"N={N} must be a multiple of tile_n={_TILE_N}"
+    assert K % _TILE_K == 0, f"K={K} must be a multiple of tile_k={_TILE_K}"
+
+    output = torch.empty((TotalM, N), dtype=torch.bfloat16, device=XQ.device)
+    if TotalM == 0 or N == 0 or K == 0 or G == 0:
+        return output
+
+    upper_bound = TotalM // _TILE_M + G
+    if torch.cuda.is_current_stream_capturing():
+        num_m_tiles = upper_bound
+    else:
+        tiles_per_group = (M_sizes + (_TILE_M - 1)) // _TILE_M
+        num_m_tiles = int(tiles_per_group.sum().item())
+
+    tile_group, tile_row_start, tile_row_limit = _build_tile_map(
+        M_sizes, _TILE_M, TotalM, num_m_tiles
+    )
+
+    launcher = compile_grouped_gemm_blockscale_contiguous(
+        n=N,
+        k=K,
+        num_groups=G,
+        tile_m=_TILE_M,
+        tile_n=_TILE_N,
+        tile_k=_TILE_K,
+        scale_block_k=_SCALE_BLOCK,
+        scale_block_n=_SCALE_BLOCK,
+        out_dtype="bf16",
+        b_preshuffled=False,
+    )
+
+    # WQ is plain [G, N, K] — passed as-is (no preshuffle). FP8 viewed as int8.
+    run_compiled(
+        launcher,
+        output.view(-1),
+        XQ.contiguous().view(-1).view(torch.int8),
+        WQ.contiguous().view(-1).view(torch.int8),
+        x_scale.contiguous().view(-1),
+        w_scale.contiguous().view(-1),
+        tile_group,
+        tile_row_start,
+        tile_row_limit,
+        TotalM,
+        N,
+        K,
+        G,
+        num_m_tiles,
+        torch.cuda.current_stream(),
+    )
+    return output
+
+
 if is_flydsl_available():
 
     @torch.library.impl(_OP_NAME, "CUDA")
@@ -180,3 +255,25 @@ if is_flydsl_available():
         return matmul_f8f8bf16_groupwise_grouped_preshuffle(
             XQ, WQ, x_scale, w_scale, M_sizes
         )
+
+    # Plain op: FlyDSL is the ROCm impl of mslk::f8f8bf16_groupwise_grouped
+    # (C++ schema in gemm_ops.cpp; the Triton impl is being retired). Guard the
+    # registration so it no-ops if the schema/op isn't present or already bound.
+    if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
+        if hasattr(torch.ops.mslk, "f8f8bf16_groupwise_grouped"):
+            try:
+
+                @torch.library.impl("mslk::f8f8bf16_groupwise_grouped", "CUDA")
+                def _f8f8bf16_groupwise_grouped_cuda(
+                    XQ: torch.Tensor,
+                    WQ: torch.Tensor,
+                    x_scale: torch.Tensor,
+                    w_scale: torch.Tensor,
+                    M_sizes: torch.Tensor,
+                ) -> torch.Tensor:
+                    return matmul_f8f8bf16_groupwise_grouped(
+                        XQ, WQ, x_scale, w_scale, M_sizes
+                    )
+
+            except RuntimeError:
+                pass  # already registered
