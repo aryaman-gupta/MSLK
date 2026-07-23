@@ -24,13 +24,13 @@ Tensor contract:
 
 import torch
 
+from mslk.gemm.flydsl.grouped_gemm_tuning import get_tile_config
 from mslk.utils.flydsl import is_flydsl_available, run_compiled
 
 _OP_NAME = "mslk::f8f8bf16_groupwise_grouped_preshuffle"
 
-_TILE_M = 128
-_TILE_N = 128
-_TILE_K = 128
+# tile_m/tile_n/tile_k are now selected per-shape by get_tile_config; only the
+# scale-block granularity is fixed.
 _SCALE_BLOCK = 128
 
 torch.library.define(
@@ -52,58 +52,23 @@ def _f8f8bf16_groupwise_grouped_preshuffle_meta(
     return XQ.new_empty((TotalM, N), dtype=torch.bfloat16)
 
 
-def _build_tile_map(
-    M_sizes: torch.Tensor, tile_m: int, total_m: int, num_m_tiles_bound: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build the per-tile dispatch arrays consumed by the kernel.
-
-    Returns ``(tile_group, tile_row_start, tile_row_limit)``, each int32 of
-    length ``num_m_tiles_bound``. Entry ``t`` maps output M-tile ``t`` to its
-    group id, its first global row, and its group's exclusive row end. Tiles
-    past the actual tile count are marked ``tile_group = -1`` so the kernel
-    skips them (the grid is launched to a host-known upper bound).
-
-    Built with fixed-shape tensor ops (no ``.item()``) so it is safe to record
-    into a CUDA graph and regenerate on replay from updated ``M_sizes``.
-    """
-    device = M_sizes.device
-    G = M_sizes.shape[0]
-    tiles_per_group = (M_sizes + (tile_m - 1)) // tile_m  # [G] int64
-    m_starts = M_sizes.cumsum(0) - M_sizes  # [G] exclusive group row start
-    tile_starts = tiles_per_group.cumsum(0) - tiles_per_group  # [G] first tile per group
-    num_m_tiles = tiles_per_group.sum()  # scalar tensor (device)
-
-    t = torch.arange(num_m_tiles_bound, device=device)  # [bound]
-    # group id per tile = number of group-starts at or before t, minus 1.
-    # searchsorted on the inclusive tile-end prefix gives the owning group.
-    tile_ends = tile_starts + tiles_per_group  # [G] exclusive tile end per group
-    tile_group = torch.searchsorted(tile_ends, t, right=True).to(torch.int32)  # [bound]
-
-    # Clamp group index for gathering (surplus tiles read group 0, then masked).
-    g_idx = tile_group.to(torch.long).clamp(max=G - 1)
-    local_tile = t - tile_starts[g_idx]
-    row_start = m_starts[g_idx] + local_tile * tile_m
-    row_limit = m_starts[g_idx] + M_sizes[g_idx]
-
-    # Mark surplus tiles (t >= num_m_tiles) as no-op.
-    valid = t < num_m_tiles
-    tile_group = torch.where(valid, tile_group, torch.full_like(tile_group, -1))
-    tile_row_start = torch.where(
-        valid, row_start, torch.zeros_like(row_start)
-    ).to(torch.int32)
-    tile_row_limit = torch.where(
-        valid, row_limit, torch.zeros_like(row_limit)
-    ).to(torch.int32)
-    return tile_group, tile_row_start, tile_row_limit
-
-
-def matmul_f8f8bf16_groupwise_grouped_preshuffle(
+def _dispatch_grouped_gemm(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     M_sizes: torch.Tensor,
+    *,
+    b_preshuffled: bool,
 ) -> torch.Tensor:
+    """Shared dispatch for both grouped ops. WQ is already in the layout the
+    variant expects (MFMA-preshuffled if b_preshuffled else plain [G,N,K]).
+
+    Selects (tile_m, tile_n, tile_k) from the static tuning table
+    (grouped_gemm_tuning.get_tile_config), then builds the per-tile dispatch map,
+    compiles, and launches. The tuned tile_m is used CONSISTENTLY for the
+    tile-map / grid extent AND the kernel compile (they must agree).
+    """
     from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_contiguous import (
         compile_grouped_gemm_blockscale_contiguous,
     )
@@ -113,36 +78,40 @@ def matmul_f8f8bf16_groupwise_grouped_preshuffle(
     TotalM, K = XQ.shape
     G, N, Kw = WQ.shape
     assert Kw == K, f"K mismatch: XQ K={K}, WQ K={Kw}"
-    assert N % _TILE_N == 0, f"N={N} must be a multiple of tile_n={_TILE_N}"
-    assert K % _TILE_K == 0, f"K={K} must be a multiple of tile_k={_TILE_K}"
+
+    tile_m, tile_n, tile_k = get_tile_config(
+        b_preshuffled=b_preshuffled, total_m=TotalM, n=N, k=K, g=G
+    )
+    assert N % tile_n == 0, f"N={N} must be a multiple of tile_n={tile_n}"
+    assert K % tile_k == 0, f"K={K} must be a multiple of tile_k={tile_k}"
 
     output = torch.empty((TotalM, N), dtype=torch.bfloat16, device=XQ.device)
     if TotalM == 0 or N == 0 or K == 0 or G == 0:
         return output
 
-    # Grid M-extent: exact tile count when eager, host-known upper bound under
-    # CUDA-graph capture (each group wastes at most one partial tile).
-    upper_bound = TotalM // _TILE_M + G
-    if torch.cuda.is_current_stream_capturing():
-        num_m_tiles = upper_bound
-    else:
-        tiles_per_group = (M_sizes + (_TILE_M - 1)) // _TILE_M
-        num_m_tiles = int(tiles_per_group.sum().item())
+    # Grid M-extent: a host-known upper bound (each group wastes at most one
+    # partial tile). Computed from static shapes, never from M_sizes contents, so
+    # dispatch stays sync-free (no .item() device->host stall) in eager mode and
+    # remains valid under CUDA-graph capture. The kernel resolves group ownership
+    # per M-tile directly from M_sizes; surplus tiles (bx >= actual tile count)
+    # match no group and self-skip, so overcounting only costs a few no-op blocks.
+    num_m_tiles = TotalM // tile_m + G
 
-    tile_group, tile_row_start, tile_row_limit = _build_tile_map(
-        M_sizes, _TILE_M, TotalM, num_m_tiles
-    )
+    # The kernel reads M_sizes as int32 (buffer_load i32 idiom). Cast once on the
+    # host -- a single tiny kernel, vs the ~8-kernel host tile-map this replaced.
+    m_sizes_i32 = M_sizes.to(torch.int32)
 
     launcher = compile_grouped_gemm_blockscale_contiguous(
         n=N,
         k=K,
         num_groups=G,
-        tile_m=_TILE_M,
-        tile_n=_TILE_N,
-        tile_k=_TILE_K,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
         scale_block_k=_SCALE_BLOCK,
         scale_block_n=_SCALE_BLOCK,
         out_dtype="bf16",
+        b_preshuffled=b_preshuffled,
     )
 
     # Kernel buffer resources use raw byte offsets, so pass flat tensors; FP8 is
@@ -154,9 +123,7 @@ def matmul_f8f8bf16_groupwise_grouped_preshuffle(
         WQ.contiguous().view(-1).view(torch.int8),
         x_scale.contiguous().view(-1),
         w_scale.contiguous().view(-1),
-        tile_group,
-        tile_row_start,
-        tile_row_limit,
+        m_sizes_i32,
         TotalM,
         N,
         K,
@@ -165,6 +132,19 @@ def matmul_f8f8bf16_groupwise_grouped_preshuffle(
         torch.cuda.current_stream(),
     )
     return output
+
+
+def matmul_f8f8bf16_groupwise_grouped_preshuffle(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    M_sizes: torch.Tensor,
+) -> torch.Tensor:
+    """Preshuffled-B grouped groupwise FP8 GEMM (WQ already MFMA-preshuffled)."""
+    return _dispatch_grouped_gemm(
+        XQ, WQ, x_scale, w_scale, M_sizes, b_preshuffled=True
+    )
 
 
 def matmul_f8f8bf16_groupwise_grouped(
@@ -181,65 +161,9 @@ def matmul_f8f8bf16_groupwise_grouped(
     of ``mslk::f8f8bf16_groupwise_grouped``. Uses the unified kernel with
     ``b_preshuffled=False`` (B staged HBM->LDS->registers).
     """
-    from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_contiguous import (
-        compile_grouped_gemm_blockscale_contiguous,
+    return _dispatch_grouped_gemm(
+        XQ, WQ, x_scale, w_scale, M_sizes, b_preshuffled=False
     )
-
-    assert XQ.ndim == 2, f"XQ must be [TotalM, K], got {XQ.shape}"
-    assert WQ.ndim == 3, f"WQ must be [G, N, K], got {WQ.shape}"
-    TotalM, K = XQ.shape
-    G, N, Kw = WQ.shape
-    assert Kw == K, f"K mismatch: XQ K={K}, WQ K={Kw}"
-    assert N % _TILE_N == 0, f"N={N} must be a multiple of tile_n={_TILE_N}"
-    assert K % _TILE_K == 0, f"K={K} must be a multiple of tile_k={_TILE_K}"
-
-    output = torch.empty((TotalM, N), dtype=torch.bfloat16, device=XQ.device)
-    if TotalM == 0 or N == 0 or K == 0 or G == 0:
-        return output
-
-    upper_bound = TotalM // _TILE_M + G
-    if torch.cuda.is_current_stream_capturing():
-        num_m_tiles = upper_bound
-    else:
-        tiles_per_group = (M_sizes + (_TILE_M - 1)) // _TILE_M
-        num_m_tiles = int(tiles_per_group.sum().item())
-
-    tile_group, tile_row_start, tile_row_limit = _build_tile_map(
-        M_sizes, _TILE_M, TotalM, num_m_tiles
-    )
-
-    launcher = compile_grouped_gemm_blockscale_contiguous(
-        n=N,
-        k=K,
-        num_groups=G,
-        tile_m=_TILE_M,
-        tile_n=_TILE_N,
-        tile_k=_TILE_K,
-        scale_block_k=_SCALE_BLOCK,
-        scale_block_n=_SCALE_BLOCK,
-        out_dtype="bf16",
-        b_preshuffled=False,
-    )
-
-    # WQ is plain [G, N, K] — passed as-is (no preshuffle). FP8 viewed as int8.
-    run_compiled(
-        launcher,
-        output.view(-1),
-        XQ.contiguous().view(-1).view(torch.int8),
-        WQ.contiguous().view(-1).view(torch.int8),
-        x_scale.contiguous().view(-1),
-        w_scale.contiguous().view(-1),
-        tile_group,
-        tile_row_start,
-        tile_row_limit,
-        TotalM,
-        N,
-        K,
-        G,
-        num_m_tiles,
-        torch.cuda.current_stream(),
-    )
-    return output
 
 
 if is_flydsl_available():
