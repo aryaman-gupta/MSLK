@@ -22,7 +22,6 @@ if not torch.cuda.is_available():
 from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_contiguous import (
     compile_grouped_gemm_blockscale_contiguous,
 )
-from mslk.gemm.flydsl.fp8_groupwise_grouped_gemm import _build_tile_map
 from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_group
 
 _TILE_M = 128
@@ -44,11 +43,10 @@ def _run(m_values, N, K, tile_n=128, tile_k=128):
     w_scale = torch.stack(ws_list, dim=0).contiguous()
     xq, x_scale = quantize_fp8_group(x, m_sizes=m_sizes)
 
-    tiles_per_group = (m_sizes + (_TILE_M - 1)) // _TILE_M
-    num_m_tiles = int(tiles_per_group.sum().item())
-    tile_group, tile_row_start, tile_row_limit = _build_tile_map(
-        m_sizes, _TILE_M, TotalM, num_m_tiles
-    )
+    # Host-known upper bound on M-tiles (matches the op wrapper); the kernel
+    # resolves group ownership per tile from m_sizes and self-skips surplus tiles.
+    num_m_tiles = TotalM // _TILE_M + G
+    m_sizes_i32 = m_sizes.to(torch.int32)
 
     d = torch.zeros(TotalM, N, dtype=torch.bfloat16, device=device)
     launch_fn = compile_grouped_gemm_blockscale_contiguous(
@@ -63,9 +61,7 @@ def _run(m_values, N, K, tile_n=128, tile_k=128):
         wq.contiguous().view(-1).view(torch.int8),   # PLAIN B
         x_scale.contiguous().view(-1),
         w_scale.contiguous().view(-1),
-        tile_group,
-        tile_row_start,
-        tile_row_limit,
+        m_sizes_i32,
         TotalM,
         N,
         K,

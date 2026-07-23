@@ -186,9 +186,7 @@ def compile_grouped_gemm_blockscale_contiguous(
         arg_b: fx.Tensor,
         arg_scale_a: fx.Tensor,
         arg_scale_b: fx.Tensor,
-        arg_tile_group: fx.Tensor,
-        arg_tile_row_start: fx.Tensor,
-        arg_tile_row_limit: fx.Tensor,
+        arg_m_sizes: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         i32_k: fx.Int32,
@@ -263,17 +261,47 @@ def compile_grouped_gemm_blockscale_contiguous(
         sb_nbytes = num_groups_in * fx.Index(scale_n * scale_k * scale_byte_size)
         sb_rsrc = buffer_ops.create_buffer_resource(arg_scale_b, max_size=False, num_records_bytes=sb_nbytes)
 
-        # Per-tile dispatch map: one int32 entry per M-tile.
-        num_m_tiles_in = fx.Index(i32_num_m_tiles)
-        tm_nbytes = num_m_tiles_in * fx.Index(4)
-        tg_rsrc = buffer_ops.create_buffer_resource(arg_tile_group, max_size=False, num_records_bytes=tm_nbytes)
-        trs_rsrc = buffer_ops.create_buffer_resource(arg_tile_row_start, max_size=False, num_records_bytes=tm_nbytes)
-        trl_rsrc = buffer_ops.create_buffer_resource(arg_tile_row_limit, max_size=False, num_records_bytes=tm_nbytes)
+        # Resolve which group owns this flat M-tile id (bx) directly from M_sizes,
+        # in-kernel. The old design precomputed a per-tile dispatch map on the
+        # host (arange/cumsum/searchsorted/where -> 3 int32 arrays); under
+        # CUDA-graph capture that replayed as ~8 tiny kernels costing a flat
+        # ~60us/call -- over half the op at decode. num_groups is a compile-time
+        # constant, so this loop fully unrolls to a handful of scalar ops with no
+        # extra launches. acc_m/acc_t are the running m_starts/tile_starts
+        # prefixes. Tiles beyond the actual tile count (the grid is a host-known
+        # upper bound) match no group and stay marked -1 (skipped below).
+        ms_rsrc = buffer_ops.create_buffer_resource(
+            arg_m_sizes, max_size=False, num_records_bytes=num_groups_in * fx.Index(4)
+        )
 
-        # Group id for this M-tile; -1 marks a surplus tile (grid may be launched
-        # to a host-known upper bound that exceeds the actual tile count).
-        group_id_i32 = buffer_ops.buffer_load(tg_rsrc, bx, vec_width=1, dtype=T.i32)
-        is_valid = arith.cmpi(arith.CmpIPredicate.sge, group_id_i32, fx.Int32(0))
+        def _c(v):  # raw i32 constant (arith.* requires unwrapped MLIR values)
+            return arith.constant(int(v), type=T.i32)
+
+        bx_i32 = arith.index_cast(T.i32, bx)
+        tile_m_c = _c(tile_m)
+        tile_m_bump = _c(tile_m - 1)
+        acc_m = _c(0)  # cumulative rows before group g (m_starts[g])
+        acc_t = _c(0)  # cumulative tiles before group g (tile_starts[g])
+        group_id_i32 = _c(-1)
+        row_start_i32 = _c(0)
+        row_limit_i32 = _c(0)
+        for _g in range_constexpr(num_groups):
+            m_g = buffer_ops.buffer_load(ms_rsrc, _g, vec_width=1, dtype=T.i32)
+            tiles_g = arith.divui(arith.addi(m_g, tile_m_bump), tile_m_c)
+            acc_t_next = arith.addi(acc_t, tiles_g)
+            in_grp = arith.andi(
+                arith.cmpi(arith.CmpIPredicate.sge, bx_i32, acc_t),
+                arith.cmpi(arith.CmpIPredicate.slt, bx_i32, acc_t_next),
+            )
+            rs = arith.addi(acc_m, arith.muli(arith.subi(bx_i32, acc_t), tile_m_c))
+            rl = arith.addi(acc_m, m_g)
+            group_id_i32 = arith.select(in_grp, _c(_g), group_id_i32)
+            row_start_i32 = arith.select(in_grp, rs, row_start_i32)
+            row_limit_i32 = arith.select(in_grp, rl, row_limit_i32)
+            acc_m = arith.addi(acc_m, m_g)
+            acc_t = acc_t_next
+
+        is_valid = arith.cmpi(arith.CmpIPredicate.sge, group_id_i32, _c(0))
 
         # Early exit for surplus/no-op tiles.
         if is_valid:
@@ -281,8 +309,6 @@ def compile_grouped_gemm_blockscale_contiguous(
 
             # Global row base of this tile and the exclusive row end of its group
             # (the group end masks the partial-tile tail in the epilogue store).
-            row_start_i32 = buffer_ops.buffer_load(trs_rsrc, bx, vec_width=1, dtype=T.i32)
-            row_limit_i32 = buffer_ops.buffer_load(trl_rsrc, bx, vec_width=1, dtype=T.i32)
             bx_m = fx.Index(row_start_i32)
 
             _t = compute_mfma_tiling(tile_m=tile_m, tile_n=tile_n)
@@ -532,9 +558,7 @@ def compile_grouped_gemm_blockscale_contiguous(
         arg_b: fx.Tensor,
         arg_scale_a: fx.Tensor,
         arg_scale_b: fx.Tensor,
-        arg_tile_group: fx.Tensor,
-        arg_tile_row_start: fx.Tensor,
-        arg_tile_row_limit: fx.Tensor,
+        arg_m_sizes: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         i32_k: fx.Int32,
@@ -560,9 +584,7 @@ def compile_grouped_gemm_blockscale_contiguous(
             arg_b,
             arg_scale_a,
             arg_scale_b,
-            arg_tile_group,
-            arg_tile_row_start,
-            arg_tile_row_limit,
+            arg_m_sizes,
             i32_m,
             i32_n,
             i32_k,
