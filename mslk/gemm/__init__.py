@@ -44,5 +44,6 @@ if torch.version.hip is not None:
     from mslk.flydsl.common import is_flydsl_available
 
     if is_flydsl_available():
-        # Registers mslk::f8f8bf16_groupwise_grouped_preshuffle (FlyDSL).
+        # Registers mslk::f8f8bf16_groupwise_grouped and its _preshuffle
+        # sibling (FlyDSL).
         from .flydsl import fp8_groupwise_grouped_gemm as _flydsl_groupwise_grouped

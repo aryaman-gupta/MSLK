@@ -6,17 +6,24 @@
 
 # pyre-unsafe
 
-"""FP8 groupwise-scaled grouped GEMM (preshuffled weights) via FlyDSL.
+"""FP8 groupwise-scaled grouped GEMM via FlyDSL.
 
-Registers ``mslk::f8f8bf16_groupwise_grouped_preshuffle``, the ROCm sibling of
-``mslk::f8f8bf16_groupwise_grouped`` that consumes weights already in the MFMA
-B-preshuffle layout (see ``mslk.quantize.shuffle.preshuffle_b_mfma``). Callers
-shuffle weights once at load time; the op does no shuffling.
+Registers two ops, both backed by the same kernel:
+
+* ``mslk::f8f8bf16_groupwise_grouped`` -- the ROCm implementation of the plain
+  op, taking row-major ``[G, N, K]`` weights.
+* ``mslk::f8f8bf16_groupwise_grouped_preshuffle`` -- a sibling that consumes
+  weights already in the MFMA B-preshuffle layout (see
+  ``mslk.quantize.shuffle.preshuffle_b_mfma``). Callers shuffle once at load
+  time; the op does no shuffling.
 
 Tensor contract:
   XQ      : [TotalM, K]             FP8  -- all groups concatenated along M
   WQ      : [G, N, K]               FP8  -- per-group weights, MFMA-preshuffled
-  x_scale : [K//128, TotalM]        FP32 -- per-token per-128K scales (transposed)
+                                            for the preshuffle op
+  x_scale :                         FP32 -- per-token per-128K scales, in the
+                                            per-group block layout produced by
+                                            quantize_fp8_group(m_sizes=...)
   w_scale : [G, K//128, N//128]     FP32 -- per-group per-block scales
   M_sizes : [G]                     int64 -- rows per group (sum to TotalM)
   Output  : [TotalM, N]             BF16

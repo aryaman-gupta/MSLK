@@ -5,23 +5,22 @@
 
 Groups are concatenated along M with arbitrary (not tile-aligned) per-group row
 counts, and the output is compact [M_total, N]. Each output M-tile belongs to
-exactly one group; work is dispatched over a precomputed per-tile map rather
-than a per-row group id, so a tile never spans a group boundary.
+exactly one group, so a tile never spans a group boundary. The kernel resolves
+the owning group for its M-tile from m_sizes, and rows at or beyond that group's
+end are the partial-tile tail and are masked out of the store.
 
 Scales are FP32 (software scaling) on all architectures.
 
 Tensors:
   - A: [M_total, K] FP8 - concatenated rows from all groups
-  - scale_a: [scale_k, M_total] FP32 - per-token, per-128K scales (transposed)
+  - scale_a: FP32 per-token, per-128K scales, laid out as per-group blocks (as
+    written by quantize_fp8_group with m_sizes): group g's block begins at
+    m_start * scale_k, and within it element (local_m, k_block) sits at
+    local_m + k_block * M_g. This is not a global [scale_k, M_total] transpose.
   - B: [num_groups, N, K] FP8 - one weight matrix per group, preshuffled
   - scale_b: [num_groups, scale_k, scale_n] FP32 - per-block scales
+  - m_sizes: [num_groups] INT32 - rows per group (sum to M_total)
   - D: [M_total, N] BF16 - output
-
-Per-tile dispatch metadata (length = number of M-tiles; index by M-tile id):
-  - tile_group: INT32 - group id owning the tile (-1 marks a surplus/no-op tile)
-  - tile_row_start: INT32 - global row (into A/scale_a/D) of the tile's first row
-  - tile_row_limit: INT32 - exclusive global row end of the tile's group; rows at
-    or beyond it are the partial-tile tail and are masked out of the store
 
 Block scaling granularity:
   - A: (1, 128) - per-token, per-128-K-elements
@@ -202,7 +201,6 @@ def compile_grouped_gemm_blockscale_contiguous(
         i32_n: fx.Int32,
         i32_k: fx.Int32,
         i32_num_groups: fx.Int32,
-        i32_num_m_tiles: fx.Int32,
     ):
         # Convert runtime parameters to index type
         m_in = fx.Index(i32_m)
@@ -285,19 +283,19 @@ def compile_grouped_gemm_blockscale_contiguous(
             arg_m_sizes, max_size=False, num_records_bytes=num_groups_in * fx.Index(4)
         )
 
-        def _c(v):  # raw i32 constant (arith.* requires unwrapped MLIR values)
+        def _i32(v):  # raw i32 constant (arith.* requires unwrapped MLIR values)
             return arith.constant(int(v), type=T.i32)
 
         bx_i32 = arith.index_cast(T.i32, bx)
-        tile_m_c = _c(tile_m)
-        tile_m_bump = _c(tile_m - 1)
-        acc_m = _c(0)  # cumulative rows before group g (m_starts[g])
-        acc_t = _c(0)  # cumulative tiles before group g (tile_starts[g])
-        group_id_i32 = _c(-1)
-        row_start_i32 = _c(0)
-        row_limit_i32 = _c(0)
-        group_m_start_i32 = _c(0)  # first global row of the owning group
-        group_m_size_i32 = _c(0)  # row count of the owning group
+        tile_m_c = _i32(tile_m)
+        tile_m_bump = _i32(tile_m - 1)
+        acc_m = _i32(0)  # cumulative rows before group g (m_starts[g])
+        acc_t = _i32(0)  # cumulative tiles before group g (tile_starts[g])
+        group_id_i32 = _i32(-1)
+        row_start_i32 = _i32(0)
+        row_limit_i32 = _i32(0)
+        group_m_start_i32 = _i32(0)  # first global row of the owning group
+        group_m_size_i32 = _i32(0)  # row count of the owning group
         for _g in range_constexpr(num_groups):
             m_g = buffer_ops.buffer_load(ms_rsrc, _g, vec_width=1, dtype=T.i32)
             tiles_g = arith.divui(arith.addi(m_g, tile_m_bump), tile_m_c)
@@ -308,7 +306,7 @@ def compile_grouped_gemm_blockscale_contiguous(
             )
             rs = arith.addi(acc_m, arith.muli(arith.subi(bx_i32, acc_t), tile_m_c))
             rl = arith.addi(acc_m, m_g)
-            group_id_i32 = arith.select(in_grp, _c(_g), group_id_i32)
+            group_id_i32 = arith.select(in_grp, _i32(_g), group_id_i32)
             row_start_i32 = arith.select(in_grp, rs, row_start_i32)
             row_limit_i32 = arith.select(in_grp, rl, row_limit_i32)
             group_m_start_i32 = arith.select(in_grp, acc_m, group_m_start_i32)
@@ -316,7 +314,7 @@ def compile_grouped_gemm_blockscale_contiguous(
             acc_m = arith.addi(acc_m, m_g)
             acc_t = acc_t_next
 
-        is_valid = arith.cmpi(arith.CmpIPredicate.sge, group_id_i32, _c(0))
+        is_valid = arith.cmpi(arith.CmpIPredicate.sge, group_id_i32, _i32(0))
 
         # Early exit for surplus/no-op tiles.
         if is_valid:
@@ -588,9 +586,9 @@ def compile_grouped_gemm_blockscale_contiguous(
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
 
-        # Grid dimensions. The M axis indexes the per-tile dispatch map; its
-        # extent is the (host-known) tile count, which is the length of the
-        # tile_group/tile_row_start/tile_row_limit arrays.
+        # Grid dimensions. The M axis enumerates output M-tiles; its extent is a
+        # host-known upper bound on the tile count, and tiles past the real count
+        # match no group and exit early.
         n_in = fx.Index(i32_n)
         gx = n_in // fx.Index(tile_n)  # N-blocks
         gy = fx.Index(i32_num_m_tiles)  # M-tiles
@@ -606,7 +604,6 @@ def compile_grouped_gemm_blockscale_contiguous(
             i32_n,
             i32_k,
             i32_num_groups,
-            i32_num_m_tiles,
         )
         if waves_per_eu is not None:
             _wpe = int(waves_per_eu)
