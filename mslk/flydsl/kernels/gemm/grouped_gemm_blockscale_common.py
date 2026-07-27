@@ -66,11 +66,64 @@ def validate_params(*, n, k, tile_n, tile_k, scale_block_k, scale_block_n, out_d
         raise ValueError(f"out_dtype must be 'bf16' or 'f16', got {out_dtype!r}")
 
 
-# gfx950 has 64 KiB of LDS per workgroup.
-_LDS_CAPACITY_BYTES = 64 * 1024
+# Conservative default for architectures missing from FlyDSL's capacity table.
+_LDS_CAPACITY_FALLBACK_BYTES = 64 * 1024
 
 
-def validate_lds_budget_plain(*, tile_m, tile_n, tile_k, elem_bytes=1, b_pingpong=False):
+def lds_capacity_bytes(arch=None):
+    """LDS bytes available to one workgroup on ``arch``.
+
+    This is arch-dependent and the difference is large: CDNA3 (gfx942/MI300) has
+    64 KiB while CDNA4 (gfx950/MI350) has 160 KiB. Sourced from FlyDSL's
+    SMEM_CAPACITY_MAP so the limit stays in sync with the compiler that enforces
+    it; unknown architectures fall back to the conservative 64 KiB.
+    """
+    try:
+        from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+    except Exception:
+        return _LDS_CAPACITY_FALLBACK_BYTES
+    return SMEM_CAPACITY_MAP.get(str(arch), _LDS_CAPACITY_FALLBACK_BYTES)
+
+
+def _check_lds_budget(*, variant, total, detail, tile_m, tile_n, tile_k, arch):
+    """Raise ValueError if ``total`` LDS bytes overflow the device capacity.
+
+    Must run BEFORE the kernel is traced: the compiler backend reports an LDS
+    overflow as a hard error that aborts the process, which an autotuner cannot
+    catch and skip.
+    """
+    capacity = lds_capacity_bytes(arch)
+    if total > capacity:
+        raise ValueError(
+            f"{variant} LDS budget {total} bytes exceeds {capacity} on "
+            f"{arch or 'unknown arch'} ({detail}) for tile_m={tile_m} "
+            f"tile_n={tile_n} tile_k={tile_k}. Reduce tile_m/tile_n/tile_k."
+        )
+
+
+def validate_lds_budget_preshuffle(*, tile_m, tile_n, tile_k, elem_bytes=1, arch=None):
+    """Check the preshuffle-B kernel's LDS budget fits in one workgroup's LDS.
+
+    B is loaded HBM->registers here, so only the ping-pong A tiles occupy LDS
+    during the K-loop; the CShuffle epilogue output aliases that same arena.
+    Budget = max(A ping-pong, epilogue out).
+    """
+    lds_a_bytes = 2 * tile_m * tile_k * elem_bytes  # ping-pong A
+    lds_out_bytes = tile_m * tile_n * 2  # bf16/f16 epilogue output, aliases base
+    _check_lds_budget(
+        variant="preshuffle-B",
+        total=max(lds_a_bytes, lds_out_bytes),
+        detail=f"A ping-pong {lds_a_bytes}, epilogue {lds_out_bytes}",
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        arch=arch,
+    )
+
+
+def validate_lds_budget_plain(
+    *, tile_m, tile_n, tile_k, elem_bytes=1, b_pingpong=False, arch=None
+):
     """Check the plain-B kernel's LDS budget fits in one workgroup's LDS.
 
     The plain-B kernel stages BOTH A (ping-pong) and B through LDS during the
@@ -83,15 +136,18 @@ def validate_lds_budget_plain(*, tile_m, tile_n, tile_k, elem_bytes=1, b_pingpon
     lds_b_bytes = b_buffers * tile_n * tile_k * elem_bytes
     lds_out_bytes = tile_m * tile_n * 2  # bf16/f16 epilogue output, aliases base
     kloop_bytes = lds_a_bytes + lds_b_bytes
-    total = max(kloop_bytes, lds_out_bytes)
-    if total > _LDS_CAPACITY_BYTES:
-        raise ValueError(
-            f"plain-B LDS budget {total} bytes exceeds {_LDS_CAPACITY_BYTES} "
-            f"(A ping-pong {lds_a_bytes} + B {lds_b_bytes} = {kloop_bytes}, "
-            f"epilogue {lds_out_bytes}) for tile_m={tile_m} tile_n={tile_n} "
-            f"tile_k={tile_k} b_pingpong={b_pingpong}. Reduce tile_n/tile_k or "
-            f"disable b_pingpong."
-        )
+    _check_lds_budget(
+        variant="plain-B",
+        total=max(kloop_bytes, lds_out_bytes),
+        detail=(
+            f"A ping-pong {lds_a_bytes} + B {lds_b_bytes} = {kloop_bytes}, "
+            f"epilogue {lds_out_bytes}, b_pingpong={b_pingpong}"
+        ),
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        arch=arch,
+    )
 
 
 def out_mlir_for(out_dtype):

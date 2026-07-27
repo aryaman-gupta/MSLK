@@ -60,6 +60,7 @@ from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
     setup_lds_allocation,
     setup_lds_allocation_plain,
     validate_lds_budget_plain,
+    validate_lds_budget_preshuffle,
     validate_params,
 )
 from mslk.flydsl.kernels.mma.mfma_epilogues import mfma_epilog
@@ -123,9 +124,19 @@ def compile_grouped_gemm_blockscale_contiguous(
         scale_block_n=scale_block_n,
         out_dtype=out_dtype,
     )
-    if not b_preshuffled:
-        # Plain B needs its own LDS buffer alongside A — enforce the byte budget.
-        validate_lds_budget_plain(tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, b_pingpong=False)
+    # Check the LDS budget before tracing: the compiler treats an overflow as a
+    # hard error that kills the process, which an autotuner cannot skip. Capacity
+    # is arch-dependent (64 KiB gfx942, 160 KiB gfx950).
+    if b_preshuffled:
+        # Preshuffled B goes HBM->registers; only A ping-pong / epilogue use LDS.
+        validate_lds_budget_preshuffle(
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, arch=gpu_arch
+        )
+    else:
+        # Plain B needs its own LDS buffer alongside A.
+        validate_lds_budget_plain(
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, b_pingpong=False, arch=gpu_arch
+        )
     out_mlir = out_mlir_for(out_dtype)
 
     _c = compute_compile_constants(
