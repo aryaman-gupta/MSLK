@@ -694,6 +694,8 @@ def make_compute_tile(
     mfma_res_ty,
     acc_init,
     sa_group_off=None,
+    group_m_start=None,
+    group_m_size=None,
 ):
     """Build the per-K-tile compute closure.
 
@@ -717,7 +719,16 @@ def make_compute_tile(
             s_a_vecs = []
             s_b_vals = []
             if not _use_hw_scale:
-                if sa_group_off is None:
+                if group_m_start is not None:
+                    # quantize_fp8_group(m_sizes=...) stores scale_a as per-group
+                    # blocks: group g starts at M_start*scale_k and holds element
+                    # (local_m, k_g) at local_m + k_g*M_g. This is NOT a global
+                    # [scale_k, TotalM] transpose -- the two only coincide when
+                    # there is one group or one K-block.
+                    # sa_idx adds row_global (= M_start + local_m) below, so fold
+                    # the -M_start into the base: M_start*(scale_k-1) + k_g*M_g.
+                    sa_base = group_m_start * fx.Index(scale_k - 1) + kb * group_m_size
+                elif sa_group_off is None:
                     sa_base = kb * m_in
                 else:
                     sa_base = sa_group_off + kb * m_in

@@ -296,6 +296,8 @@ def compile_grouped_gemm_blockscale_contiguous(
         group_id_i32 = _c(-1)
         row_start_i32 = _c(0)
         row_limit_i32 = _c(0)
+        group_m_start_i32 = _c(0)  # first global row of the owning group
+        group_m_size_i32 = _c(0)  # row count of the owning group
         for _g in range_constexpr(num_groups):
             m_g = buffer_ops.buffer_load(ms_rsrc, _g, vec_width=1, dtype=T.i32)
             tiles_g = arith.divui(arith.addi(m_g, tile_m_bump), tile_m_c)
@@ -309,6 +311,8 @@ def compile_grouped_gemm_blockscale_contiguous(
             group_id_i32 = arith.select(in_grp, _c(_g), group_id_i32)
             row_start_i32 = arith.select(in_grp, rs, row_start_i32)
             row_limit_i32 = arith.select(in_grp, rl, row_limit_i32)
+            group_m_start_i32 = arith.select(in_grp, acc_m, group_m_start_i32)
+            group_m_size_i32 = arith.select(in_grp, m_g, group_m_size_i32)
             acc_m = arith.addi(acc_m, m_g)
             acc_t = acc_t_next
 
@@ -482,6 +486,8 @@ def compile_grouped_gemm_blockscale_contiguous(
                 col_offset_base_bytes=col_offset_base_bytes,
                 mfma_res_ty=mfma_res_ty,
                 acc_init=acc_init,
+                group_m_start=fx.Index(group_m_start_i32),
+                group_m_size=fx.Index(group_m_size_i32),
             )
 
             if const_expr(b_preshuffled):
