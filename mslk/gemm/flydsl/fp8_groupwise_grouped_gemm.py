@@ -26,7 +26,8 @@ import os
 
 import torch
 
-from mslk.utils.flydsl import is_flydsl_available, run_compiled
+from mslk.flydsl.common import is_flydsl_available
+from mslk.flydsl.jit import run_compiled
 
 _OP_NAME = "mslk::f8f8bf16_groupwise_grouped_preshuffle"
 

@@ -911,7 +911,7 @@ class FP8GroupwiseTests(unittest.TestCase):
         )
 
         if preshuffle:
-            from mslk.utils.flydsl import is_flydsl_available
+            from mslk.flydsl.common import is_flydsl_available
 
             if not is_flydsl_available():
                 self.skipTest("FlyDSL not available")

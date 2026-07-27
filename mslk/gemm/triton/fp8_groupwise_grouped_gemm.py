@@ -293,7 +293,7 @@ def matmul_f8f8bf16_groupwise_grouped(
 # when FlyDSL is absent. Only one CUDA impl can win, so we gate here rather
 # than relying on import order. (The Triton path is slated for removal once the
 # FlyDSL swap lands.)
-from mslk.utils.flydsl import is_flydsl_available as _is_flydsl_available
+from mslk.flydsl.common import is_flydsl_available as _is_flydsl_available
 
 if (
     torch.version.hip is not None
