@@ -35,6 +35,7 @@ import torch
 
 from mslk.flydsl.common import is_flydsl_available
 from mslk.flydsl.jit import run_compiled
+from mslk.utils.device import supports_float8_fnuz
 
 _OP_NAME = "mslk::f8f8bf16_groupwise_grouped_preshuffle"
 
@@ -70,7 +71,7 @@ def _next_pow2(x: int) -> int:
 
 
 def _launch_kernel(
-    XQ, WQ, x_scale, w_scale, m_sizes_i32, output, *, tile_m, tile_n, tile_k, b_preshuffled
+    XQ, WQ, x_scale, w_scale, m_sizes, output, *, tile_m, tile_n, tile_k, b_preshuffled
 ):
     """Compile (cached) and launch the grouped GEMM for one tile config. Shared
     by the autotune target and the fixed-config path. Writes into `output`."""
@@ -103,7 +104,7 @@ def _launch_kernel(
         WQ.contiguous().view(-1).view(torch.int8),
         x_scale.contiguous().view(-1),
         w_scale.contiguous().view(-1),
-        m_sizes_i32,
+        m_sizes,
         TotalM,
         N,
         K,
@@ -133,7 +134,7 @@ def _f8f8bf16_groupwise_grouped_preshuffle_meta(
 
 
 def _autotune_target(
-    XQ, WQ, x_scale, w_scale, m_sizes_i32, output, m_bucket, n, k, b_preshuffled,
+    XQ, WQ, x_scale, w_scale, m_sizes, output, m_bucket, n, k, b_preshuffled,
     *, tile_m, tile_n, tile_k,
 ):
     """FlyDSL @autotune benchmarks this per candidate tile. Keyed on
@@ -143,7 +144,7 @@ def _autotune_target(
     can't share a tuned config). Key args are otherwise passed straight through.
     tile_* arrive as Config kwargs."""
     return _launch_kernel(
-        XQ, WQ, x_scale, w_scale, m_sizes_i32, output,
+        XQ, WQ, x_scale, w_scale, m_sizes, output,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, b_preshuffled=b_preshuffled,
     )
 
@@ -211,22 +212,32 @@ def _dispatch_grouped_gemm(
     """
     assert XQ.ndim == 2, f"XQ must be [TotalM, K], got {XQ.shape}"
     assert WQ.ndim == 3, f"WQ must be [G, N, K], got {WQ.shape}"
+    assert M_sizes.ndim == 1, f"M_sizes must be [G], got {M_sizes.shape}"
     TotalM, K = XQ.shape
     G, N, Kw = WQ.shape
     assert Kw == K, f"K mismatch: XQ K={K}, WQ K={Kw}"
+    assert M_sizes.shape[0] == G, f"M_sizes length {M_sizes.shape[0]} must equal G={G}"
+    # The MFMA instructions read the operands in the arch's native FP8 format, and
+    # the kernel passes them through as raw bytes, so an fnuz/OCP mismatch would
+    # be applied with the wrong exponent bias rather than rejected.
+    expected_fp8 = (
+        torch.float8_e4m3fnuz if supports_float8_fnuz() else torch.float8_e4m3fn
+    )
+    assert XQ.dtype == expected_fp8, f"XQ must be {expected_fp8}, got {XQ.dtype}"
+    assert WQ.dtype == expected_fp8, f"WQ must be {expected_fp8}, got {WQ.dtype}"
+    assert M_sizes.dtype == torch.int64, (
+        f"M_sizes must be int64, got {M_sizes.dtype}"
+    )
 
     output = torch.empty((TotalM, N), dtype=torch.bfloat16, device=XQ.device)
     if TotalM == 0 or N == 0 or K == 0 or G == 0:
         return output
 
-    # The kernel reads M_sizes as int32 (buffer_load i32 idiom).
-    m_sizes_i32 = M_sizes.to(torch.int32)
-
     if os.environ.get("MSLK_AUTOTUNE_ENABLE"):
         # FlyDSL's Autotuner discards the target's return value, so we rely on the
         # kernel writing into `output` in-place and return that buffer ourselves.
         _get_autotuner()(
-            XQ, WQ, x_scale, w_scale, m_sizes_i32, output,
+            XQ, WQ, x_scale, w_scale, M_sizes, output,
             _next_pow2(TotalM), N, K, b_preshuffled,
         )
         return output
@@ -235,7 +246,7 @@ def _dispatch_grouped_gemm(
     assert N % tile_n == 0, f"N={N} must be a multiple of tile_n={tile_n}"
     assert K % tile_k == 0, f"K={K} must be a multiple of tile_k={tile_k}"
     return _launch_kernel(
-        XQ, WQ, x_scale, w_scale, m_sizes_i32, output,
+        XQ, WQ, x_scale, w_scale, M_sizes, output,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, b_preshuffled=b_preshuffled,
     )
 

@@ -19,7 +19,7 @@ Tensors:
     local_m + k_block * M_g. This is not a global [scale_k, M_total] transpose.
   - B: [num_groups, N, K] FP8 - one weight matrix per group, preshuffled
   - scale_b: [num_groups, scale_k, scale_n] FP32 - per-block scales
-  - m_sizes: [num_groups] INT32 - rows per group (sum to M_total)
+  - m_sizes: [num_groups] INT64 - rows per group (sum to M_total)
   - D: [M_total, N] BF16 - output
 
 Block scaling granularity:
@@ -280,7 +280,7 @@ def compile_grouped_gemm_blockscale_contiguous(
         # prefixes. Tiles beyond the actual tile count (the grid is a host-known
         # upper bound) match no group and stay marked -1 (skipped below).
         ms_rsrc = buffer_ops.create_buffer_resource(
-            arg_m_sizes, max_size=False, num_records_bytes=num_groups_in * fx.Index(4)
+            arg_m_sizes, max_size=False, num_records_bytes=num_groups_in * fx.Index(8)
         )
 
         def _i32(v):  # raw i32 constant (arith.* requires unwrapped MLIR values)
@@ -297,7 +297,10 @@ def compile_grouped_gemm_blockscale_contiguous(
         group_m_start_i32 = _i32(0)  # first global row of the owning group
         group_m_size_i32 = _i32(0)  # row count of the owning group
         for _g in range_constexpr(num_groups):
-            m_g = buffer_ops.buffer_load(ms_rsrc, _g, vec_width=1, dtype=T.i32)
+            # m_sizes is int64; read the low dword of element _g (index _g*2 in
+            # dwords). Row counts fit in int32, so the high dword is always zero
+            # and no host-side narrowing kernel is needed.
+            m_g = buffer_ops.buffer_load(ms_rsrc, _g * 2, vec_width=1, dtype=T.i32)
             tiles_g = arith.divui(arith.addi(m_g, tile_m_bump), tile_m_c)
             acc_t_next = arith.addi(acc_t, tiles_g)
             in_grp = arith.andi(
