@@ -902,19 +902,17 @@ class FP8GroupwiseTests(unittest.TestCase):
     def test_f8f8bf16_groupwise_grouped(
         self, m_values: list, N: int, K: int, preshuffle: bool
     ) -> None:
-        # preshuffle=False exercises the plain op (Triton on ROCm, CUTLASS on
-        # CUDA); preshuffle=True exercises the FlyDSL preshuffle sibling op,
-        # which takes weights pre-swizzled into the MFMA B layout.
         from mslk.quantize.triton.fp8_quantize import (
             quantize_fp8_block,
             quantize_fp8_group,
         )
 
-        if preshuffle:
-            from mslk.flydsl.common import is_flydsl_available
+        # FlyDSL backs both variants on ROCm, and the preshuffle op exists only
+        # there, so skip when it is unavailable.
+        from mslk.flydsl.common import is_flydsl_available
 
-            if not is_flydsl_available():
-                self.skipTest("FlyDSL not available")
+        if (preshuffle or torch.version.hip is not None) and not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
 
         G = len(m_values)
         device = self.device
