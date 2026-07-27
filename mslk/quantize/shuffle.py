@@ -207,25 +207,33 @@ def ck_preshuffle(src: torch.Tensor, NXdl: int = 16) -> torch.Tensor:
     return dst
 
 
-def preshuffle_b_mfma(src: torch.Tensor, NLane: int = 16) -> torch.Tensor:
+def preshuffle_b_mfma(src: torch.Tensor) -> torch.Tensor:
     """Swizzle FP8 weights into the layout MFMA A8 GEMM kernels load B from.
 
     Rearranges the trailing ``(N, K)`` of ``src`` into
-    ``(N0, K0, KLane, NLane, KPack)`` order (``KPack=16``, ``KLane=64//NLane``),
-    which places each wave's 16x64 B fragment contiguously so it can be read
-    without a transpose. A leading group dimension is preserved, so both a
-    single weight ``[N, K]`` and per-group weights ``[G, N, K]`` are accepted.
+    ``(N0, K0, KLane, NLane, KPack)`` order, which places each wave's 16x64 B
+    fragment contiguously so it can be read without a transpose. A leading group
+    dimension is preserved, so both a single weight ``[N, K]`` and per-group
+    weights ``[G, N, K]`` are accepted.
+
+    The tile dimensions are fixed at ``NLane=16``, ``KLane=4``, ``KPack=16``
+    because the consuming kernels build their B layout with those extents
+    hardcoded (see ``make_preshuffle_b_layout``); any other choice produces a
+    layout they cannot read.
 
     Args:
         src: FP8 weights, ``[N, K]`` or ``[G, N, K]``.
-        NLane: N lanes per wave tile (16 for the 16x16 MFMA layout).
 
     Returns:
         The swizzled tensor, same shape and dtype as ``src``.
     """
+    NLane, KLane, KPack = 16, 4, 16
     N, K = src.shape[-2], src.shape[-1]
-    KPack = 16
-    KLane = 64 // NLane
+    if N % NLane or K % (KLane * KPack):
+        raise ValueError(
+            f"preshuffle_b_mfma needs N % {NLane} == 0 and K % {KLane * KPack} == 0, "
+            f"got N={N} K={K}"
+        )
     K0 = K // (KLane * KPack)
     lead = src.shape[:-2]
     src = src.reshape(*lead, N // NLane, NLane, K0, KLane, KPack)

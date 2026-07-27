@@ -148,9 +148,13 @@ def _autotune_target(
     )
 
 
-def _prune_tiles(configs, named_args):
+def _prune_tiles(configs, named_args, **kwargs):
     """Drop tile configs invalid for this shape (tile_n must divide N, tile_k
-    must divide K) before benchmarking."""
+    must divide K) before benchmarking.
+
+    FlyDSL's Autotuner calls this as ``(configs, sig_args)``; ``**kwargs`` keeps
+    it compatible with the Triton-style ``(configs, named_args, **meta)`` form.
+    """
     WQ = named_args.get("WQ")
     XQ = named_args.get("XQ")
     if WQ is None or XQ is None:
