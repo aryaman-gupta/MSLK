@@ -98,13 +98,17 @@ def _launch_kernel(
         out_dtype="bf16",
         b_preshuffled=b_preshuffled,
     )
+    # Operands keep their natural shape: argument marshalling packs each memref
+    # extent as int32, which a flattened view overflows at 2**31 elements. The
+    # kernel addresses them as flat byte buffers regardless. FP8 is viewed as
+    # int8 for the handoff.
     run_compiled(
         launcher,
-        output.view(-1),
-        XQ.contiguous().view(-1).view(torch.int8),
-        WQ.contiguous().view(-1).view(torch.int8),
-        x_scale.contiguous().view(-1),
-        w_scale.contiguous().view(-1),
+        output,
+        XQ.contiguous().view(torch.int8),
+        WQ.contiguous().view(torch.int8),
+        x_scale.contiguous(),
+        w_scale.contiguous(),
         m_sizes,
         TotalM,
         N,
