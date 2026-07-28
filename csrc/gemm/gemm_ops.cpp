@@ -65,6 +65,11 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def(
       "f8f8bf16_groupwise_grouped(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor");
 #ifdef USE_ROCM
+  // Sibling of f8f8bf16_groupwise_grouped taking weights already swizzled into
+  // the MFMA B layout; schema only on ROCm, implemented by the same FlyDSL
+  // module via torch.library.impl at Python import time.
+  m.def(
+      "f8f8bf16_groupwise_grouped_preshuffle(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor");
   m.def(
       "f8f8f16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True) -> Tensor");
   m.def(

@@ -115,13 +115,6 @@ def _launch_kernel(
     )
     return output
 
-torch.library.define(
-    _OP_NAME,
-    "(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor",
-)
-
-
-@torch.library.impl(_OP_NAME, "Meta")
 def _f8f8bf16_groupwise_grouped_preshuffle_meta(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -283,38 +276,23 @@ def matmul_f8f8bf16_groupwise_grouped(
     )
 
 
-if is_flydsl_available():
+if is_flydsl_available() and torch.version.hip is not None and hasattr(torch.ops, "mslk"):
+    # FlyDSL supplies the ROCm implementation of both ops; their schemas are
+    # declared in csrc/gemm/gemm_ops.cpp. Skip an op whose schema is missing, as
+    # in a python-only build, and tolerate a repeat import rebinding it.
+    def _register(op_name, cuda_fn, meta_fn=None) -> None:
+        if not hasattr(torch.ops.mslk, op_name.split("::")[1]):
+            return
+        try:
+            torch.library.impl(op_name, "CUDA")(cuda_fn)
+            if meta_fn is not None:
+                torch.library.impl(op_name, "Meta")(meta_fn)
+        except RuntimeError:
+            pass
 
-    @torch.library.impl(_OP_NAME, "CUDA")
-    def _f8f8bf16_groupwise_grouped_preshuffle_cuda(
-        XQ: torch.Tensor,
-        WQ: torch.Tensor,
-        x_scale: torch.Tensor,
-        w_scale: torch.Tensor,
-        M_sizes: torch.Tensor,
-    ) -> torch.Tensor:
-        return matmul_f8f8bf16_groupwise_grouped_preshuffle(
-            XQ, WQ, x_scale, w_scale, M_sizes
-        )
-
-    # Plain op: FlyDSL is the ROCm implementation of
-    # mslk::f8f8bf16_groupwise_grouped, whose C++ schema lives in gemm_ops.cpp.
-    # Guard the registration so it no-ops if the schema is absent or already bound.
-    if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
-        if hasattr(torch.ops.mslk, "f8f8bf16_groupwise_grouped"):
-            try:
-
-                @torch.library.impl("mslk::f8f8bf16_groupwise_grouped", "CUDA")
-                def _f8f8bf16_groupwise_grouped_cuda(
-                    XQ: torch.Tensor,
-                    WQ: torch.Tensor,
-                    x_scale: torch.Tensor,
-                    w_scale: torch.Tensor,
-                    M_sizes: torch.Tensor,
-                ) -> torch.Tensor:
-                    return matmul_f8f8bf16_groupwise_grouped(
-                        XQ, WQ, x_scale, w_scale, M_sizes
-                    )
-
-            except RuntimeError:
-                pass  # already registered
+    _register(
+        _OP_NAME,
+        matmul_f8f8bf16_groupwise_grouped_preshuffle,
+        _f8f8bf16_groupwise_grouped_preshuffle_meta,
+    )
+    _register("mslk::f8f8bf16_groupwise_grouped", matmul_f8f8bf16_groupwise_grouped)
