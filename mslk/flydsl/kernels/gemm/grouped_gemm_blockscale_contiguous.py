@@ -270,15 +270,13 @@ def compile_grouped_gemm_blockscale_contiguous(
         sb_nbytes = num_groups_in * fx.Index(scale_n * scale_k * scale_byte_size)
         sb_rsrc = buffer_ops.create_buffer_resource(arg_scale_b, max_size=False, num_records_bytes=sb_nbytes)
 
-        # Resolve which group owns this flat M-tile id (bx) directly from M_sizes,
-        # in-kernel. The old design precomputed a per-tile dispatch map on the
-        # host (arange/cumsum/searchsorted/where -> 3 int32 arrays); under
-        # CUDA-graph capture that replayed as ~8 tiny kernels costing a flat
-        # ~60us/call -- over half the op at decode. num_groups is a compile-time
-        # constant, so this loop fully unrolls to a handful of scalar ops with no
-        # extra launches. acc_m/acc_t are the running m_starts/tile_starts
-        # prefixes. Tiles beyond the actual tile count (the grid is a host-known
-        # upper bound) match no group and stay marked -1 (skipped below).
+        # Resolve which group owns this flat M-tile id (bx) from m_sizes. Doing it
+        # here rather than from a host-built dispatch map keeps the launch free of
+        # helper kernels, which matters under CUDA-graph capture where each one is
+        # replayed per call. num_groups is a compile-time constant, so the loop
+        # unrolls to a few scalar ops. acc_m/acc_t are the running m_start and
+        # tile_start prefixes; tiles beyond the real tile count (the grid extent is
+        # an upper bound) match no group and stay marked -1.
         ms_rsrc = buffer_ops.create_buffer_resource(
             arg_m_sizes, max_size=False, num_records_bytes=num_groups_in * fx.Index(8)
         )

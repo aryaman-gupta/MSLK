@@ -961,9 +961,6 @@ class FP8GroupwiseTests(unittest.TestCase):
 
         self.assertFalse(out.isnan().any().item(), "Output contains NaN")
         self.assertFalse(out.isinf().any().item(), "Output contains Inf")
-        # Outputs here are O(1e-2), so the tolerance has to be tight enough to
-        # stay below the signal: FP8 block quantization accounts for ~4e-3, while
-        # a per-group scale misindex shows up at ~2e-2.
         torch.testing.assert_close(out, ref, atol=1.0e-2, rtol=4.0e-2)
 
 

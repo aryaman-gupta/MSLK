@@ -48,9 +48,10 @@ _SCALE_BLOCK = 128
 # CI / no-benchmark path -- matches the CUTLASS heuristic fallback tile.
 _DEFAULT_TILE = (128, 128, 128)
 
-# Candidate tile space swept by autotune. tile_m multiple of 16; tile_n multiple
-# of scale_block_n=128; tile_k=128. Configs invalid for a given shape (tile_n>N
-# or N%tile_n) are pruned per-call before benchmarking.
+# Candidate tile space swept by autotune. tile_n must be a multiple of
+# scale_block_n=128 so a tile never straddles a weight scale block, and tile_k is
+# pinned to the same granularity. Configs that do not divide a given shape are
+# pruned before benchmarking, and ones that overflow LDS are rejected at compile.
 _AUTOTUNE_TILES = (
     (64, 128, 128),
     (128, 128, 128),
@@ -234,8 +235,8 @@ def _dispatch_grouped_gemm(
         return output
 
     if os.environ.get("MSLK_AUTOTUNE_ENABLE"):
-        # FlyDSL's Autotuner discards the target's return value, so we rely on the
-        # kernel writing into `output` in-place and return that buffer ourselves.
+        # FlyDSL's Autotuner discards the tuned function's return value, so read
+        # the result from the output buffer the kernel wrote into.
         _get_autotuner()(
             XQ, WQ, x_scale, w_scale, M_sizes, output,
             _next_pow2(TotalM), N, K, b_preshuffled,
@@ -273,10 +274,9 @@ def matmul_f8f8bf16_groupwise_grouped(
 ) -> torch.Tensor:
     """Plain (non-preshuffled) grouped groupwise FP8 GEMM via FlyDSL.
 
-    Same contract as the preshuffle sibling but WQ is plain row-major [G, N, K]
-    (not MFMA-preshuffled) — the drop-in FlyDSL replacement for the Triton impl
-    of ``mslk::f8f8bf16_groupwise_grouped``. Uses the unified kernel with
-    ``b_preshuffled=False`` (B staged HBM->LDS->registers).
+    Same contract as the preshuffle sibling, but WQ is plain row-major
+    ``[G, N, K]``. Uses the shared kernel with ``b_preshuffled=False``, which
+    stages B through LDS instead of loading it straight to registers.
     """
     return _dispatch_grouped_gemm(
         XQ, WQ, x_scale, w_scale, M_sizes, b_preshuffled=False
@@ -297,9 +297,9 @@ if is_flydsl_available():
             XQ, WQ, x_scale, w_scale, M_sizes
         )
 
-    # Plain op: FlyDSL is the ROCm impl of mslk::f8f8bf16_groupwise_grouped
-    # (C++ schema in gemm_ops.cpp; the Triton impl is being retired). Guard the
-    # registration so it no-ops if the schema/op isn't present or already bound.
+    # Plain op: FlyDSL is the ROCm implementation of
+    # mslk::f8f8bf16_groupwise_grouped, whose C++ schema lives in gemm_ops.cpp.
+    # Guard the registration so it no-ops if the schema is absent or already bound.
     if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
         if hasattr(torch.ops.mslk, "f8f8bf16_groupwise_grouped"):
             try:

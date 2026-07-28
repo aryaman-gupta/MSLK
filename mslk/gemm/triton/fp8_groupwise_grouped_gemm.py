@@ -288,11 +288,10 @@ def matmul_f8f8bf16_groupwise_grouped(
 # On ROCm the CUDA C++ implementation is absent; this module registers the
 # Triton kernel above as the dispatch target via torch.library.impl.
 #
-# FALLBACK ONLY: when FlyDSL is available it owns this op (see
-# mslk/gemm/flydsl/fp8_groupwise_grouped_gemm.py); Triton registers it only
-# when FlyDSL is absent. Only one CUDA impl can win, so we gate here rather
-# than relying on import order. (The Triton path is slated for removal once the
-# FlyDSL swap lands.)
+# FALLBACK ONLY: FlyDSL owns this op where it is available (see
+# mslk/gemm/flydsl/fp8_groupwise_grouped_gemm.py), so Triton registers it only
+# when FlyDSL is absent. Only one CUDA implementation can win, hence the explicit
+# gate rather than a dependence on import order.
 from mslk.flydsl.common import is_flydsl_available as _is_flydsl_available
 
 if (

@@ -787,12 +787,12 @@ def make_compute_tile(
                             [a128, b128, current_accs[acc_idx], 0, 0, 0, sa_e8m0_list[mi], 0, sb_e8m0_list[ni]],
                         )
             elif _is_gfx950:
-                # Fast SW path (gfx950): use the wide 16x16x128 MFMA with a
-                # neutral E8M0 scale (0x7F7F7F7F = no-op HW scaling), accumulate
-                # a whole scale-block into block_accs, then apply the FP32 scales
-                # in software once per scale-block. Mirrors the working
-                # blockscale_preshuffle_gemm kernel. This avoids the 4x-narrower
-                # 16x16x32 MFMA and the per-K-step VALU scale tax below.
+                # gfx950: use the wide 16x16x128 MFMA with a neutral E8M0 scale
+                # (0x7F7F7F7F = no-op hardware scaling), accumulate a whole
+                # scale-block into block_accs, then apply the FP32 scales in
+                # software once per scale-block. This avoids both the 4x-narrower
+                # 16x16x32 MFMA and the per-K-step VALU scale cost of the path
+                # below.
                 combined_scales = []
                 for mi in range_constexpr(m_repeat):
                     mi_combined = []
@@ -881,26 +881,21 @@ def make_kloop_plain(
     lds_base_pong,
     lds_base_b,
 ):
-    """Simple (non-ping-pong) K-loop for the plain-B kernel.
+    """Single-LDS-buffer K-loop for the plain-B kernel.
 
-    Plain B is staged HBM->LDS->registers each K-tile, alongside A. This variant
-    prioritizes CORRECTNESS: single A buffer + single B buffer, one barrier
-    separating the HBM->LDS stores from the LDS->register reads per K-tile. It
-    deliberately forgoes the ping-pong overlap of `make_pingpong_kloop` — that
-    overlap is a perf optimization to restore once the plain-B fragment mapping
-    is validated. `lds_base_pong` is reused as the single A buffer base.
+    Plain B is staged HBM->LDS->registers each K-tile, alongside A. A and B each
+    get one LDS buffer rather than the ping-pong pair `make_pingpong_kloop` uses,
+    which keeps the LDS budget within reach at wide tile_n but costs two barriers
+    per K-tile: one after the stores, and one at the end of the iteration before
+    the buffers are overwritten. Global-load latency is still overlapped, by
+    issuing the next tile's HBM loads into registers before computing the current
+    one. `lds_base_pong` is reused as the single A buffer base.
     """
 
     def run_kloop(accs):
         if num_k_tiles == 0:
             return accs
 
-        # Software-pipelined, single-LDS-buffer variant: the NEXT K-tile's A/B
-        # HBM loads (VGPR prefetch) are issued BEFORE computing the current tile,
-        # so global-load latency overlaps the current tile's MFMAs. LDS stays
-        # single-buffered (fits the LDS budget even at wide tile_n, unlike a
-        # double-buffered LDS ping-pong), at the cost of one barrier per tile to
-        # separate the compute-read from the next store.
         a_regs = prefetch_a_tile(0)
         b_regs = prefetch_b_tile(0)
         for kt in range_constexpr(num_k_tiles):
@@ -961,8 +956,8 @@ def make_pingpong_kloop(
         a0_prefetch_pong = lds_load_packs_k64(row_a_lds_base, col_offset_base_bytes, lds_base_pong)
 
         for k_pair in range_constexpr(0, num_k_tiles, 2):
-            # Prefetch next scales BEFORE B-tile VMEM (per moe-2stage pattern:
-            # scale-load latency hides behind heavy B VMEM); then A+B regs.
+            # Prefetch the next scales before the B-tile VMEM so the scale-load
+            # latency hides behind it; then the A+B registers.
             if k_pair + 1 < num_k_tiles:
                 scales_ping_pf = prefetch_scales(k_pair + 1)
                 a_regs_ping = prefetch_a_tile(k_pair + 1)
