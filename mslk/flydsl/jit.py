@@ -9,10 +9,12 @@
 """Just-in-time compilation support for FlyDSL kernels in MSLK.
 
 Kernel modules use these helpers to dispatch a FlyDSL host launcher with
-torch tensors, compiling on first use. On import this also points FlyDSL at
-the bundled AOT cache so precompiled kernels are served without a front-end
-compile, falling back to JIT on a cache miss. Availability detection lives
-in :mod:`mslk.flydsl.common`.
+torch tensors, compiling on first use. :func:`configure_runtime_cache` points
+FlyDSL at the bundled AOT cache so precompiled kernels are served without a
+front-end compile, falling back to JIT on a cache miss; the package
+``__init__`` calls it, so it applies to every FlyDSL kernel rather than only
+to those launched from here. Availability detection lives in
+:mod:`mslk.flydsl.common`.
 """
 
 import os
@@ -49,6 +51,3 @@ def run_compiled(launcher: Callable[..., Any], *args: Any) -> None:
         launcher._mslk_cf = flyc.compile(launcher, *args)  # pyre-ignore[16]
     else:
         cf(*args)
-
-
-configure_runtime_cache()
