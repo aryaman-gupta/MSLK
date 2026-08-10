@@ -25,6 +25,7 @@ from flydsl._mlir.dialects import math as math_dialect
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T, Vector
+from mslk.flydsl.common import lds_capacity_bytes
 from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import (
     crd2idx,
     lds_store_16b_xor16,
@@ -187,25 +188,6 @@ def validate_params(
             )
     if out_dtype not in ("bf16", "f16"):
         raise ValueError(f"out_dtype must be 'bf16' or 'f16', got {out_dtype!r}")
-
-
-# Conservative default for architectures missing from FlyDSL's capacity table.
-_LDS_CAPACITY_FALLBACK_BYTES = 64 * 1024
-
-
-def lds_capacity_bytes(arch=None):
-    """LDS bytes available to one workgroup on ``arch``.
-
-    This is arch-dependent and the difference is large: CDNA3 (gfx942/MI300) has
-    64 KiB while CDNA4 (gfx950/MI350) has 160 KiB. Sourced from FlyDSL's
-    SMEM_CAPACITY_MAP so the limit stays in sync with the compiler that enforces
-    it; unknown architectures fall back to the conservative 64 KiB.
-    """
-    try:
-        from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
-    except Exception:
-        return _LDS_CAPACITY_FALLBACK_BYTES
-    return SMEM_CAPACITY_MAP.get(str(arch), _LDS_CAPACITY_FALLBACK_BYTES)
 
 
 def _check_lds_budget(*, variant, total, detail, tile_m, tile_n, tile_k, arch):
