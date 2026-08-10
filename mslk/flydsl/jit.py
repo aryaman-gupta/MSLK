@@ -51,3 +51,22 @@ def run_compiled(launcher: Callable[..., Any], *args: Any) -> None:
         launcher._mslk_cf = flyc.compile(launcher, *args)  # pyre-ignore[16]
     else:
         cf(*args)
+
+
+def ptr_arg(tensor: Any) -> Any:
+    """Wrap a tensor's data pointer as a FlyDSL pointer kernel argument.
+
+    A launcher declaring ``fx.Pointer`` operands takes the raw address rather
+    than the tensor, so its call sites pass every operand through here; one
+    declaring ``fx.Tensor`` operands takes them directly and does not.
+
+    A fake tensor has no storage to address and becomes a null pointer: meta
+    tracing only has to get through the call, never to run it.
+    """
+    import flydsl.compiler as flyc  # pyre-ignore[21]
+    import flydsl.expr as fx  # pyre-ignore[21]
+
+    cls = type(tensor)
+    if cls.__name__ == "FakeTensor" or "fake_tensor" in cls.__module__:
+        return flyc.from_c_void_p(fx.Uint8, 0)
+    return flyc.from_c_void_p(fx.Uint8, tensor.data_ptr())
