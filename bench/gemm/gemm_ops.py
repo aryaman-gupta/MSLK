@@ -1271,10 +1271,6 @@ class FP8RowwiseGroupedDynamicPreshuffle(FP8RowwiseGroupedDynamic):
     op_name = "f8f8bf16_rowwise_grouped_dynamic_preshuffle"
     preshuffled = True
 
-    @property
-    def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.AMD_GFX950}
-
 
 @register_gemm_op
 class FP8RowwiseGrouped3D3D(_FlyDSLRowwiseGroupedBase):
@@ -1318,10 +1314,6 @@ class FP8RowwiseGrouped2D3DPreshuffle(FP8RowwiseGrouped2D3D):
         )
 
     @property
-    def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.AMD_GFX950}
-
-    @property
     def supported(self) -> bool:
         if not super().supported:
             return False
@@ -1345,7 +1337,8 @@ class FP8RowwiseGroupedPreshuffle(FP8RowwiseGrouped):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.AMD_GFX950}
+        # The preshuffled sibling has no schema off ROCm, unlike its parent.
+        return _ROCM_GROUPED
 
     @property
     def supported(self) -> bool:
