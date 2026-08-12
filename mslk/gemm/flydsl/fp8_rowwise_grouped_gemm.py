@@ -48,21 +48,8 @@ Tensor contract:
 import torch
 from mslk.flydsl.common import is_flydsl_available
 from mslk.gemm.flydsl import grouped_dispatch
-from mslk.utils.device import supports_float8_fnuz
 
 _STACKED_PRESHUFFLE_OP_NAME = "mslk::f8f8bf16_rowwise_grouped_stacked_preshuffle"
-
-
-def _assert_fp8_operands(XQ: torch.Tensor, WQ: torch.Tensor) -> None:
-    """Reject a mismatched FP8 flavour.
-
-    The MFMA instructions read the operands in the arch's native FP8 format, and
-    the kernel passes them through as raw bytes, so an fnuz/OCP mismatch would be
-    applied with the wrong exponent bias rather than rejected.
-    """
-    expected = torch.float8_e4m3fnuz if supports_float8_fnuz() else torch.float8_e4m3fn
-    assert XQ.dtype == expected, f"XQ must be {expected}, got {XQ.dtype}"
-    assert WQ.dtype == expected, f"WQ must be {expected}, got {WQ.dtype}"
 
 
 def _f8f8bf16_rowwise_grouped_stacked_preshuffle_meta(
@@ -122,7 +109,7 @@ def _dispatch_rowwise_grouped(
     G, N, Kw = WQ.shape
     assert Kw == K, f"K mismatch: XQ K={K}, WQ K={Kw}"
     assert M_sizes.shape[0] == G, f"M_sizes length {M_sizes.shape[0]} must equal G={G}"
-    _assert_fp8_operands(XQ, WQ)
+    grouped_dispatch.assert_fp8_operands(XQ, WQ)
     assert M_sizes.dtype == torch.int64, f"M_sizes must be int64, got {M_sizes.dtype}"
     assert x_scale.numel() == total_M, (
         f"x_scale must hold one scale per row ({total_M}), got {x_scale.numel()}"
@@ -185,7 +172,7 @@ def _dispatch_rowwise_grouped_dynamic(
     assert zero_start_index_M.shape[0] == G, (
         f"zero_start_index_M length {zero_start_index_M.shape[0]} must equal G={G}"
     )
-    _assert_fp8_operands(XQ, WQ)
+    grouped_dispatch.assert_fp8_operands(XQ, WQ)
     assert zero_start_index_M.dtype == torch.int64, (
         f"zero_start_index_M must be int64, got {zero_start_index_M.dtype}"
     )
@@ -306,7 +293,7 @@ def _rowwise_grouped_mm_2d3d(
         f"out must be [total_M, N] = {(total_M, N)}, got {tuple(out.shape)}"
     )
     assert out.is_contiguous(), "out must be contiguous"
-    _assert_fp8_operands(XQ, WQ)
+    grouped_dispatch.assert_fp8_operands(XQ, WQ)
 
     grouped_dispatch.dispatch(
         XQ,
@@ -350,7 +337,7 @@ def _rowwise_grouped_mm_3d3d(
     # The kernel writes out in place, so it has to be the caller's buffer; a
     # contiguity fixup would silently write to a copy instead.
     assert out.is_contiguous(), "out must be contiguous"
-    _assert_fp8_operands(XQ, WQ)
+    grouped_dispatch.assert_fp8_operands(XQ, WQ)
 
     grouped_dispatch.dispatch(
         XQ.contiguous().view(G * M, K),
@@ -397,7 +384,7 @@ def _rowwise_grouped_mm_3d2d(XQ, WQ, x_scale, w_scale, offsets, out):
         f"out must be [M, total_N] = {(M, total_N)}, got {tuple(out.shape)}"
     )
     assert out.is_contiguous(), "out must be contiguous"
-    _assert_fp8_operands(XQ, WQ)
+    grouped_dispatch.assert_fp8_operands(XQ, WQ)
 
     grouped_dispatch.dispatch(
         XQ.contiguous().view(G * M, K),
@@ -448,7 +435,7 @@ def _rowwise_grouped_mm_2d2d(XQ, WQ, x_scale, w_scale, offsets, out):
         f"out must be [G, M, N] = {(G, M, N)}, got {tuple(out.shape)}"
     )
     assert out.is_contiguous(), "out must be contiguous"
-    _assert_fp8_operands(XQ, WQ)
+    grouped_dispatch.assert_fp8_operands(XQ, WQ)
 
     grouped_dispatch.dispatch(
         XQ,

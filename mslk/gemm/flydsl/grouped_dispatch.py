@@ -22,6 +22,7 @@ import functools
 import torch
 from mslk.flydsl.autotune import next_pow2, prune_by_divisibility, tunable
 from mslk.flydsl.jit import run_compiled
+from mslk.utils.device import supports_float8_fnuz
 
 # Scale-block granularity for the block-scaling scheme. It also sets the K-loop
 # sub-block size under either scheme, so tile_k must be a multiple of it.
@@ -70,6 +71,18 @@ _PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
 # varies per call, and a tuning space containing a fully unrolled candidate would
 # have to compile one per tile config, at a cost that grows with K.
 _KEY = ["m_bucket", "n", "k", "b_preshuffled", "blockscale", "layout"]
+
+
+def assert_fp8_operands(XQ, WQ) -> None:
+    """Reject a mismatched FP8 flavour.
+
+    The MFMA instructions read the operands in the arch's native FP8 format, and
+    the kernel passes them through as raw bytes, so an fnuz/OCP mismatch would be
+    applied with the wrong exponent bias rather than rejected.
+    """
+    expected = torch.float8_e4m3fnuz if supports_float8_fnuz() else torch.float8_e4m3fn
+    assert XQ.dtype == expected, f"XQ must be {expected}, got {XQ.dtype}"
+    assert WQ.dtype == expected, f"WQ must be {expected}, got {WQ.dtype}"
 
 
 @functools.lru_cache(maxsize=8)
