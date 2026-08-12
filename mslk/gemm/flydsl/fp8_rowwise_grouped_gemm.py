@@ -45,8 +45,6 @@ Tensor contract:
   out[m, n] = (sum_k XQ[m, k] * WQ[g, n, k]) * x_scale[m] * w_scale[g, n]
 """
 
-import functools
-
 import torch
 from mslk.flydsl.common import is_flydsl_available
 from mslk.gemm.flydsl import grouped_dispatch
@@ -65,18 +63,6 @@ def _assert_fp8_operands(XQ: torch.Tensor, WQ: torch.Tensor) -> None:
     expected = torch.float8_e4m3fnuz if supports_float8_fnuz() else torch.float8_e4m3fn
     assert XQ.dtype == expected, f"XQ must be {expected}, got {XQ.dtype}"
     assert WQ.dtype == expected, f"WQ must be {expected}, got {WQ.dtype}"
-
-
-@functools.lru_cache(maxsize=8)
-def _unused_group_meta(device: torch.device) -> torch.Tensor:
-    """Stand-in for the group-metadata operand under the batched layout.
-
-    That layout carries no per-group metadata and the kernel never reads the
-    argument, but the launcher's argument list is fixed at compile time. Caching
-    keeps a call free of an allocation and holds the address stable, which
-    CUDA-graph capture requires.
-    """
-    return torch.zeros((1,), dtype=torch.int32, device=device)
 
 
 def _f8f8bf16_rowwise_grouped_stacked_preshuffle_meta(
@@ -371,7 +357,7 @@ def _rowwise_grouped_mm_3d3d(
         WQ,
         x_scale,
         w_scale,
-        _unused_group_meta(XQ.device),
+        grouped_dispatch.unused_group_meta(XQ.device),
         b_preshuffled=b_preshuffled,
         blockscale=False,
         layout="batched",

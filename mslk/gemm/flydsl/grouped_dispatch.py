@@ -17,6 +17,8 @@ Tile selection is delegated to mslk.flydsl.autotune, which tunes only when
 MSLK_AUTOTUNE_ENABLE is set and otherwise uses a fixed default.
 """
 
+import functools
+
 import torch
 from mslk.flydsl.autotune import next_pow2, prune_by_divisibility, tunable
 from mslk.flydsl.jit import run_compiled
@@ -68,6 +70,18 @@ _PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
 # varies per call, and a tuning space containing a fully unrolled candidate would
 # have to compile one per tile config, at a cost that grows with K.
 _KEY = ["m_bucket", "n", "k", "b_preshuffled", "blockscale", "layout"]
+
+
+@functools.lru_cache(maxsize=8)
+def unused_group_meta(device: torch.device) -> torch.Tensor:
+    """Stand-in for the group-metadata operand under the batched layout.
+
+    That layout carries no per-group metadata and the kernel never reads the
+    argument, but the launcher's argument list is fixed at compile time. Caching
+    keeps a call free of an allocation and holds the address stable, which
+    CUDA-graph capture requires.
+    """
+    return torch.zeros((1,), dtype=torch.int32, device=device)
 
 
 def _group_and_n(WQ, group_meta, layout):
