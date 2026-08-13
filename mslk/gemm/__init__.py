@@ -47,7 +47,9 @@ if torch.version.hip is not None:
         # Registers mslk::f8f8bf16_groupwise_grouped and its _preshuffle
         # sibling, and the rowwise grouped ops FlyDSL backs on ROCm:
         # _stacked, _dynamic and _mm, each with its preshuffle sibling.
+        # f8f8bf16_groupwise takes its slot from the Triton import above.
         from .flydsl import (  # noqa: F401
+            fp8_groupwise_gemm as _flydsl_groupwise,
             fp8_groupwise_grouped_gemm as _flydsl_groupwise_grouped,
             fp8_rowwise_grouped_gemm as _flydsl_rowwise_grouped,
         )
