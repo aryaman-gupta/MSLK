@@ -48,11 +48,9 @@ Tensor contract:
 import functools
 
 import torch
-from mslk.flydsl.common import is_flydsl_available
+from mslk.flydsl.common import require_flydsl
 from mslk.gemm.flydsl import grouped_dispatch
 from mslk.utils.device import supports_float8_fnuz
-
-_STACKED_PRESHUFFLE_OP_NAME = "mslk::f8f8bf16_rowwise_grouped_stacked_preshuffle"
 
 
 def _assert_fp8_operands(XQ: torch.Tensor, WQ: torch.Tensor) -> None:
@@ -79,44 +77,6 @@ def _unused_group_meta(device: torch.device) -> torch.Tensor:
     return torch.zeros((1,), dtype=torch.int32, device=device)
 
 
-def _f8f8bf16_rowwise_grouped_stacked_preshuffle_meta(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    M_sizes: torch.Tensor,
-) -> torch.Tensor:
-    total_M = XQ.shape[0]
-    N = WQ.shape[1]
-    return XQ.new_empty((total_M, N), dtype=torch.bfloat16)
-
-
-def _f8f8bf16_rowwise_grouped_dynamic_meta(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    zero_start_index_M: torch.Tensor,
-    zeroing_output_tensor: bool = True,
-) -> torch.Tensor:
-    G, expected_m, _ = XQ.shape
-    N = WQ.shape[1]
-    return XQ.new_empty((G, expected_m, N), dtype=torch.bfloat16)
-
-
-def _f8f8bf16_rowwise_grouped_mm_meta(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    offsets: torch.Tensor | None,
-    out: torch.Tensor,
-) -> torch.Tensor:
-    # The op writes the caller's buffer in place and returns it, so the result
-    # is that buffer whichever rank combination the operands select.
-    return out
-
-
 def _dispatch_rowwise_grouped(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -129,6 +89,9 @@ def _dispatch_rowwise_grouped(
     """Shared dispatch for both rowwise ops. WQ is already in the layout the
     variant expects (MFMA-preshuffled if b_preshuffled else plain [G,N,K]).
     """
+    # Registration does not probe for FlyDSL, so this is the first point at
+    # which it is required.
+    require_flydsl()
     assert XQ.ndim == 2, f"XQ must be [total_M, K], got {XQ.shape}"
     assert WQ.ndim == 3, f"WQ must be [G, N, K], got {WQ.shape}"
     assert M_sizes.ndim == 1, f"M_sizes must be [G], got {M_sizes.shape}"
@@ -187,6 +150,9 @@ def _dispatch_rowwise_grouped_dynamic(
     the flattened ``[G * expected_m, ...]`` views and treats the group as a grid
     axis rather than resolving it from row counts.
     """
+    # Registration does not probe for FlyDSL, so this is the first point at
+    # which it is required.
+    require_flydsl()
     assert XQ.ndim == 3, f"XQ must be [G, M, K], got {XQ.shape}"
     assert WQ.ndim == 3, f"WQ must be [G, N, K], got {WQ.shape}"
     assert zero_start_index_M.ndim == 1, (
@@ -493,6 +459,9 @@ def matmul_f8f8bf16_rowwise_grouped_mm(
     whichever axis is grouped, and is None for 3D-3D. ``out`` is written in place
     and returned.
     """
+    # Registration does not probe for FlyDSL, so this is the first point at
+    # which it is required.
+    require_flydsl()
     ranks = (XQ.ndim, WQ.ndim)
     if ranks == (2, 3):
         return _rowwise_grouped_mm_2d3d(XQ, WQ, x_scale, w_scale, offsets, out)
@@ -523,6 +492,9 @@ def matmul_f8f8bf16_rowwise_grouped_mm_preshuffle(
     axes the swizzle interleaves, so 3D-2D and 2D-2D have no preshuffled form
     and are rejected rather than silently given the plain path.
     """
+    # Registration does not probe for FlyDSL, so this is the first point at
+    # which it is required.
+    require_flydsl()
     ranks = (XQ.ndim, WQ.ndim)
     if ranks == (2, 3):
         return _rowwise_grouped_mm_2d3d(
@@ -545,56 +517,9 @@ def matmul_f8f8bf16_rowwise_grouped_mm_preshuffle(
     )
 
 
-if (
-    is_flydsl_available()
-    and torch.version.hip is not None
-    and hasattr(torch.ops, "mslk")
-):
-    # FlyDSL supplies the ROCm implementation of these ops; their schemas are
-    # declared in csrc/gemm/gemm_ops.cpp, which leaves every one of these slots
-    # free on ROCm so these bindings can take them. Skip an op whose schema is
-    # missing, as in a python-only build or against a binary built before the
-    # schema was added, and tolerate a repeat import rebinding it.
-    def _register(op_name, cuda_fn, meta_fn=None) -> None:
-        if not hasattr(torch.ops.mslk, op_name.split("::")[1]):
-            return
-        try:
-            torch.library.impl(op_name, "CUDA")(cuda_fn)
-            if meta_fn is not None:
-                torch.library.impl(op_name, "Meta")(meta_fn)
-        except RuntimeError:
-            pass
-
-    # _stacked already has a Meta implementation registered in mslk/gemm/_meta.py.
-    _register(
-        "mslk::f8f8bf16_rowwise_grouped_stacked",
-        matmul_f8f8bf16_rowwise_grouped_stacked,
-    )
-    _register(
-        _STACKED_PRESHUFFLE_OP_NAME,
-        matmul_f8f8bf16_rowwise_grouped_stacked_preshuffle,
-        _f8f8bf16_rowwise_grouped_stacked_preshuffle_meta,
-    )
-    _register(
-        "mslk::f8f8bf16_rowwise_grouped_dynamic",
-        matmul_f8f8bf16_rowwise_grouped_dynamic,
-        _f8f8bf16_rowwise_grouped_dynamic_meta,
-    )
-    # Every rank combination is served, which this op needs: it is one entry
-    # point covering all four, so taking the slot for some of them would break
-    # the rest.
-    _register(
-        "mslk::f8f8bf16_rowwise_grouped_mm",
-        matmul_f8f8bf16_rowwise_grouped_mm,
-        _f8f8bf16_rowwise_grouped_mm_meta,
-    )
-    _register(
-        "mslk::f8f8bf16_rowwise_grouped_dynamic_preshuffle",
-        matmul_f8f8bf16_rowwise_grouped_dynamic_preshuffle,
-        _f8f8bf16_rowwise_grouped_dynamic_meta,
-    )
-    _register(
-        "mslk::f8f8bf16_rowwise_grouped_mm_preshuffle",
-        matmul_f8f8bf16_rowwise_grouped_mm_preshuffle,
-        _f8f8bf16_rowwise_grouped_mm_meta,
-    )
+# This module registers nothing. All six ops are registered in
+# mslk/gemm/__init__.py, whose impls import this module on the first call.
+# Keeping registration out of here is what lets //mslk:gemm_ops avoid depending
+# on //mslk/mslk/gemm:flydsl_ops, and so keeps the FlyDSL wheel out of every
+# binary that merely imports mslk.gemm. Shape inference lives in
+# mslk/gemm/_meta.py for the same reason.
