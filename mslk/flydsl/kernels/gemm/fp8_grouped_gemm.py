@@ -65,6 +65,7 @@ from mslk.flydsl.kernels.gemm.fp8_grouped_gemm_common import (
     compute_compile_constants,
     compute_mfma_tiling,
     init_accumulators,
+    can_dma_a,
     make_a_dma_loader,
     make_a_tile_loaders,
     make_b_loader,
@@ -236,7 +237,18 @@ def compile_fp8_grouped_gemm(
     gpu_arch = get_hip_arch()
     # The DMA has no per-lane predicate, so a partial K tile would read across
     # the row boundary instead of returning zero.
-    if async_copy_a and (k_padding or not str(gpu_arch).startswith(("gfx942", "gfx95"))):
+    _dma_bytes = 4 if str(gpu_arch).startswith("gfx942") else 16
+    if async_copy_a and (
+        k_padding
+        or not str(gpu_arch).startswith(("gfx942", "gfx95"))
+        or not can_dma_a(
+            tile_m=tile_m,
+            tile_k=tile_k,
+            elem_bytes=1,
+            total_threads=256,
+            dma_bytes=_dma_bytes,
+        )
+    ):
         async_copy_a = False
     # This FP8 kernel always uses the FP32 software-scaling path; the shared
     # helpers' hardware E8M0 microscaling path is not used here.
@@ -654,7 +666,7 @@ def compile_fp8_grouped_gemm(
                     total_threads=total_threads,
                     elem_bytes=elem_bytes,
                     k_in=k_in,
-                    dma_bytes=(4 if str(gpu_arch).startswith("gfx942") else 16),
+                    dma_bytes=_dma_bytes,
                     k_base_div4=k_base_div4,
                 )
 

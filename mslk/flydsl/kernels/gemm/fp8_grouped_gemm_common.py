@@ -874,6 +874,17 @@ def make_b_tile_loaders(
     )
 
 
+def can_dma_a(*, tile_m, tile_k, elem_bytes, total_threads, dma_bytes):
+    """Whether the A tile divides into whole DMA transfers per thread.
+
+    The DMA moves a fixed number of bytes per lane, so a tile that leaves a
+    thread with less than one transfer stages nothing at all and the kernel
+    reads stale LDS. Anything that does not divide stays on the register path.
+    """
+    bytes_per_thread = tile_m * tile_k * elem_bytes // total_threads
+    return bytes_per_thread >= dma_bytes and bytes_per_thread % dma_bytes == 0
+
+
 def make_a_dma_loader(
     *,
     a_rsrc,
@@ -912,7 +923,17 @@ def make_a_dma_loader(
         (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
     )
     dma_dwords = dma_bytes // 4
-    n_dma = (tile_m * tile_k * elem_bytes // total_threads) // dma_bytes
+    bytes_per_thread = tile_m * tile_k * elem_bytes // total_threads
+    n_dma = bytes_per_thread // dma_bytes
+    if n_dma == 0 or bytes_per_thread % dma_bytes:
+        # Fewer than one whole transfer each, or a ragged remainder: the tile
+        # would be staged partially or not at all, and the kernel would read
+        # whatever LDS already held. Callers gate on can_dma_a to avoid this.
+        raise ValueError(
+            f"tile_m ({tile_m}) x tile_k ({tile_k}) gives {bytes_per_thread} "
+            f"bytes of A per thread, which is not a whole number of "
+            f"{dma_bytes}-byte transfers"
+        )
     k_blocks16 = arith.index(tile_k_bytes // 16)
     c4_bytes = fx.Index(4)
     k_bytes_factor = k_in * fx.Index(elem_bytes)
