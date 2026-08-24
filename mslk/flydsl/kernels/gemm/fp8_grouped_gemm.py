@@ -65,6 +65,7 @@ from mslk.flydsl.kernels.gemm.fp8_grouped_gemm_common import (
     compute_compile_constants,
     compute_mfma_tiling,
     init_accumulators,
+    make_a_dma_loader,
     make_a_tile_loaders,
     make_b_loader,
     make_b_tile_loaders,
@@ -118,6 +119,7 @@ def compile_fp8_grouped_gemm(
     k_padding: bool = False,
     n_padding: bool = False,
     roll_k: bool = False,
+    async_copy_a: bool = False,
 ):
     """Compile grouped FP8 GEMM kernel and return the JIT launcher.
 
@@ -232,6 +234,10 @@ def compile_fp8_grouped_gemm(
         n_padding = True
 
     gpu_arch = get_hip_arch()
+    # The DMA has no per-lane predicate, so a partial K tile would read across
+    # the row boundary instead of returning zero.
+    if async_copy_a and (k_padding or not str(gpu_arch).startswith(("gfx942", "gfx95"))):
+        async_copy_a = False
     # This FP8 kernel always uses the FP32 software-scaling path; the shared
     # helpers' hardware E8M0 microscaling path is not used here.
     _use_hw_scale = False
@@ -322,12 +328,13 @@ def compile_fp8_grouped_gemm(
     _scaling = "blockscale" if blockscale else "rowwise"
     _kpad = "_kpad" if k_padding else ""
     _roll = "_rollk" if roll_k else ""
+    _dma = "_dma" if async_copy_a else ""
     _wpe = f"_wpe{int(waves_per_eu)}" if waves_per_eu else ""
     _npad = "_npad" if n_padding else ""
     module_name = (
         f"grouped_gemm_{_scaling}_{layout}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_wpe}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_dma}{_wpe}"
     ).replace("-", "_")
 
     @flyc.kernel(name=module_name)
@@ -633,6 +640,24 @@ def compile_fp8_grouped_gemm(
                 a_load_bytes=a_load_bytes,
             )
 
+            if const_expr(async_copy_a):
+                dma_a_tile_to_lds = make_a_dma_loader(
+                    a_rsrc=a_rsrc,
+                    lds_a=lds_a,
+                    bx_m=bx_m,
+                    tx=tx,
+                    wave_id=wave_id,
+                    tile_m=tile_m,
+                    tile_k=tile_k,
+                    tile_k_bytes=tile_k_bytes,
+                    tile_k_dwords=tile_k_dwords,
+                    total_threads=total_threads,
+                    elem_bytes=elem_bytes,
+                    k_in=k_in,
+                    dma_bytes=(4 if str(gpu_arch).startswith("gfx942") else 16),
+                    k_base_div4=k_base_div4,
+                )
+
             lds_load_packs_k64 = make_lds_loader(
                 lds_a=lds_a,
                 layout_lds=layout_lds,
@@ -855,7 +880,12 @@ def compile_fp8_grouped_gemm(
                 # tile computes -- which is why the prefetched registers ride
                 # the loop next to the accumulators. The final tile is peeled,
                 # having no successor to prefetch.
-                _a_regs = prefetch_a_tile(0)
+                if const_expr(async_copy_a):
+                    # A goes straight to LDS, so only B's staged tile has to
+                    # ride the loop.
+                    _a_regs = []
+                else:
+                    _a_regs = prefetch_a_tile(0)
                 _b_regs = prefetch_b_tile(0)
                 _n_acc = len(accs)
                 _n_a = len(_a_regs)
@@ -881,11 +911,16 @@ def compile_fp8_grouped_gemm(
                         _accs = [Vector(v) for v in _st[:_n_acc]]
                         _a_cur = [Vector(v) for v in _st[_n_acc : _n_acc + _n_a]]
                         _b_cur = [Vector(v) for v in _st[_n_acc + _n_a :]]
-                        store_a_tile_to_lds(_a_cur, lds_base_pong)
+                        if const_expr(async_copy_a):
+                            dma_a_tile_to_lds(_kt, lds_base_pong)
+                        else:
+                            store_a_tile_to_lds(_a_cur, lds_base_pong)
                         store_b_tile_to_lds(_b_cur, lds_base_b)
                         _scales = prefetch_scales(_kt)
                         gpu.barrier()
-                        _a_nxt = prefetch_a_tile(_kt + 1)
+                        _a_nxt = [] if const_expr(async_copy_a) else prefetch_a_tile(
+                            _kt + 1
+                        )
                         _b_nxt = prefetch_b_tile(_kt + 1)
                         _b_tile = load_b_tile_from_lds(lds_base_b)
                         _accs = compute_tile(
@@ -907,7 +942,10 @@ def compile_fp8_grouped_gemm(
                     )
                 else:
                     _last = num_k_tiles - 1
-                store_a_tile_to_lds(_a_regs, lds_base_pong)
+                if const_expr(async_copy_a):
+                    dma_a_tile_to_lds(_last, lds_base_pong)
+                else:
+                    store_a_tile_to_lds(_a_regs, lds_base_pong)
                 store_b_tile_to_lds(_b_regs, lds_base_b)
                 _scales = prefetch_scales(_last)
                 gpu.barrier()

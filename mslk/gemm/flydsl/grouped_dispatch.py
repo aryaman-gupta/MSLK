@@ -194,6 +194,10 @@ def launch(
         # A group's column end is a runtime value when the groups divide N, so
         # the tail mask is always needed there.
         n_padding=(N % tile_n != 0) or layout == "n_offsets",
+        # Move the A tile global->LDS without it passing through registers.
+        # The kernel drops this where a K tail needs a per-load predicate,
+        # which the DMA cannot express, and on architectures without it.
+        async_copy_a=True,
     )
     # Operands keep their natural shape: argument marshalling packs each memref
     # extent as int32, which a flattened view overflows at 2**31 elements. The

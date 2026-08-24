@@ -21,6 +21,8 @@ B and applies them in the epilogue.
 from collections import namedtuple
 
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, memref as memref_dialect
 from flydsl._mlir.dialects import math as math_dialect
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.arith import ArithValue
@@ -870,6 +872,101 @@ def make_b_tile_loaders(
         b_col_local_i32,
         k_blocks16_b,
     )
+
+
+def make_a_dma_loader(
+    *,
+    a_rsrc,
+    lds_a,
+    bx_m,
+    tx,
+    wave_id,
+    tile_m,
+    tile_k,
+    tile_k_bytes,
+    tile_k_dwords,
+    total_threads,
+    elem_bytes,
+    k_in,
+    dma_bytes,
+    k_base_div4=None,
+):
+    """Build a loader that DMAs the A tile straight from global into LDS.
+
+    ``buffer_load_lds`` moves each lane's chunk to shared memory without it
+    passing through a VGPR, which frees the registers the staged tile would
+    otherwise occupy across the K loop and drops a wait from the critical path.
+
+    The destination is fixed: lane L of a wave lands at ``lds_ptr + L*size``,
+    so LDS is written linearly and the XOR swizzle has to move to the source
+    address instead. That works because the swizzle is an XOR and so its own
+    inverse -- reading ``global(row, swizzle(row, col))`` into the linear slot
+    for ``(row, col)`` leaves LDS holding exactly what the store-side swizzle
+    would have put there, which is what the LDS readers expect.
+
+    There is no per-lane predicate on the DMA, so this cannot serve a K tail:
+    a read past K within a row would fetch the next row rather than zero.
+    Callers must keep it to tiles that lie wholly inside K.
+    """
+    layout_a_tile_div4 = fx.make_layout(
+        (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
+    )
+    dma_dwords = dma_bytes // 4
+    n_dma = (tile_m * tile_k * elem_bytes // total_threads) // dma_bytes
+    k_blocks16 = arith.index(tile_k_bytes // 16)
+    c4_bytes = fx.Index(4)
+    k_bytes_factor = k_in * fx.Index(elem_bytes)
+
+    coords = []
+    for i in range_constexpr(n_dma):
+        coords.append(
+            tile_chunk_coord_i32(
+                arith,
+                tx_i32_base=tx * fx.Index(dma_dwords),
+                i=i,
+                total_threads=total_threads,
+                layout_tile_div4=layout_a_tile_div4,
+                chunk_i32=dma_dwords,
+            )
+        )
+
+    def dma_a_tile_to_lds(k_tile_idx_py, lds_base):
+        base_k_div4 = fx.Index(k_tile_idx_py * tile_k_dwords)
+        if k_base_div4 is not None:
+            base_k_div4 = k_base_div4 + base_k_div4
+        lds_ptr_i64 = None
+        for i in range_constexpr(n_dma):
+            row_local, col_local_i32 = coords[i]
+            col_sw = swizzle_xor16(row_local, col_local_i32 * c4_bytes, k_blocks16)
+            row_global = bx_m + row_local
+            global_byte = row_global * k_bytes_factor + (
+                base_k_div4 * c4_bytes + col_sw
+            )
+            if i == 0:
+                # One uniform base per wave; the hardware adds lane * size.
+                # The buffer is a memref here rather than a raw pointer, so
+                # take its aligned address and offset into it by hand.
+                base_idx = memref_dialect.extract_aligned_pointer_as_index(lds_a)
+                addr = (
+                    fx.Int64(arith.index_cast(T.i64, base_idx))
+                    + fx.Int64(lds_base)
+                    + fx.Int64(wave_id * 64 * dma_bytes)
+                )
+                lds_ptr_i64 = rocdl.readfirstlane(T.i64, addr)
+            else:
+                lds_ptr_i64 = lds_ptr_i64 + fx.Int64(total_threads * dma_bytes)
+            lds_ptr = llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), lds_ptr_i64)
+            rocdl.raw_ptr_buffer_load_lds(
+                a_rsrc,
+                lds_ptr,
+                fx.Int32(dma_bytes),
+                fx.Int32(global_byte),
+                fx.Int32(0),
+                fx.Int32(0),
+                fx.Int32(1),
+            )
+
+    return dma_a_tile_to_lds
 
 
 def make_lds_loader(*, lds_a, layout_lds, k_blocks16):
