@@ -292,6 +292,7 @@ def compile_fp8_grouped_gemm(
     tile_k_dwords = _c.tile_k_dwords
     chunk_i32_a = _c.chunk_i32_a
     num_a_loads = _c.num_a_loads
+    a_load_bytes = _c.a_load_bytes
     chunk_i32_b = _c.chunk_i32_b
     num_b_loads = _c.num_b_loads
 
@@ -629,6 +630,7 @@ def compile_fp8_grouped_gemm(
                 k_in=k_in,
                 k_tail_mask=k_tail_mask,
                 k_base_div4=k_base_div4,
+                a_load_bytes=a_load_bytes,
             )
 
             lds_load_packs_k64 = make_lds_loader(

@@ -29,6 +29,8 @@ from mslk.flydsl.common import lds_capacity_bytes
 from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import (
     crd2idx,
     lds_store_16b_xor16,
+    lds_store_4b_xor16,
+    lds_store_8b_xor16,
     load_b_pack_k32,
     make_preshuffle_b_layout,
     swizzle_xor16,
@@ -284,16 +286,32 @@ def compute_compile_constants(
     tile_k_dwords = tile_k_bytes // 4
     bytes_a_per_tile = tile_m * tile_k * elem_bytes
     bytes_per_thread_a = bytes_a_per_tile // total_threads
-    a_load_bytes = 16  # 16-byte loads (dwordx4)
-    chunk_i32_a = a_load_bytes // 4  # 4 dwords per load
+    # Widest load each thread's share of the tile divides into. A fixed 16-byte
+    # load leaves the narrowest tiles with less than one load apiece, staging
+    # nothing at all, so the width follows the share rather than the reverse.
+    if bytes_per_thread_a % 16 == 0:
+        a_load_bytes = 16
+    elif bytes_per_thread_a % 8 == 0:
+        a_load_bytes = 8
+    elif bytes_per_thread_a % 4 == 0:
+        a_load_bytes = 4
+    else:
+        raise ValueError(
+            f"tile_m ({tile_m}) x tile_k ({tile_k}) gives {bytes_per_thread_a} "
+            "bytes of A per thread, which is not a whole number of dwords"
+        )
+    chunk_i32_a = a_load_bytes // 4
     num_a_loads = bytes_per_thread_a // a_load_bytes
 
     # Plain-B staging (non-preshuffle kernel): B tile is [tile_n, tile_k],
     # loaded HBM->LDS just like A but with N in place of M.
     bytes_b_per_tile = tile_n * tile_k * elem_bytes
     bytes_per_thread_b = bytes_b_per_tile // total_threads
-    chunk_i32_b = a_load_bytes // 4  # same 16-byte dwordx4 load
-    num_b_loads = bytes_per_thread_b // a_load_bytes
+    # B's share depends on tile_n, not tile_m, so it keeps the widest load
+    # even where A has to narrow.
+    b_load_bytes = 16
+    chunk_i32_b = b_load_bytes // 4
+    num_b_loads = bytes_per_thread_b // b_load_bytes
 
     return CompileConstants(
         total_threads=total_threads,
@@ -615,6 +633,7 @@ def make_a_tile_loaders(
     total_threads,
     elem_bytes,
     k_in,
+    a_load_bytes=16,
     m_in=None,
     group_idx=None,
     k_tail_mask=None,
@@ -681,7 +700,7 @@ def make_a_tile_loaders(
             a_vec = buffer_ops.buffer_load(
                 a_rsrc,
                 idx_i32,
-                vec_width=4,
+                vec_width=chunk_i32_a,
                 dtype=T.i32,
                 mask=_k_tail_mask(k_tile_idx_py, base_k_div4, a_col_local_i32[i]),
             )
@@ -691,20 +710,30 @@ def make_a_tile_loaders(
     def store_a_tile_to_lds(a_parts, lds_base):
         """Write prefetched A tile from VGPRs into LDS with XOR16 swizzle."""
         for i in range_constexpr(num_a_loads):
-            lds_store_16b_xor16(
-                arith,
-                vector,
-                lds_memref=lds_a,
-                vec16_ty=T.f8x16,
+            _kw = dict(
                 layout_lds=layout_lds,
                 row_local=a_row_local[i],
                 col_local_i32=a_col_local_i32[i],
                 tx_c4=c4_bytes,
                 k_blocks16=k_blocks16,
                 lds_base=lds_base,
-                vec_part_i32x4=a_parts[i],
                 elem_bytes=elem_bytes,
             )
+            if a_load_bytes == 16:
+                lds_store_16b_xor16(
+                    arith, vector, lds_memref=lds_a, vec16_ty=T.f8x16,
+                    vec_part_i32x4=a_parts[i], **_kw,
+                )
+            elif a_load_bytes == 8:
+                lds_store_8b_xor16(
+                    arith, vector, lds_memref=lds_a, vec8_ty=T.vec(8, T.f8),
+                    vec_part_i32x2=a_parts[i], **_kw,
+                )
+            else:
+                lds_store_4b_xor16(
+                    arith, vector, lds_memref=lds_a, vec4_ty=T.vec(4, T.f8),
+                    vec_part_i32=a_parts[i], **_kw,
+                )
 
     return (
         prefetch_a_tile,
