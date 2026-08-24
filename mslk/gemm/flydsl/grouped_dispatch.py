@@ -36,7 +36,13 @@ DEFAULT_TILE = {"tile_m": 128, "tile_n": 128, "tile_k": 128, "waves_per_eu": 2}
 # size under either scheme. Rowwise scaling additionally allows tile_n below the
 # scale block, which block scaling cannot express, so the two schemes sweep
 # different sets. Tiles that overflow LDS are rejected at compile time.
-_TILE_M = (64, 128, 256)
+#
+# 32 is the smallest tile_m the A loader can express: it stages
+# tile_m * tile_k * elem_bytes bytes across 256 threads in 16-byte loads, so 16
+# would give every thread half a load and stage nothing at all. It earns its
+# place in the sweep -- a tile of 64 rows spends most of its work on padding
+# when M is a handful of decode tokens.
+_TILE_M = (32, 64, 128, 256)
 _TILE_K = (128, 256)
 
 # Occupancy target, as a minimum waves-per-EU hint to the register allocator; 0
