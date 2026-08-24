@@ -1438,13 +1438,16 @@ def make_compute_tile(
                                     T.f32x4, [a1, b_packs1[ni], mfma_mid, 0, 0, 0]
                                 )
 
-                                s_a_v4 = s_a_vecs[mi]
-                                s_b_bc = Vector.filled(
-                                    (4,), fx.Float32(s_b_vals[ni]), fx.Float32
-                                )
-                                scaled = ArithValue(mfma_result) * ArithValue(s_a_v4)
+                                if scales_pf is not None:
+                                    combined = scales_pf[sb][mi][ni]
+                                else:
+                                    combined = ArithValue(s_a_vecs[mi]) * ArithValue(
+                                        Vector.filled(
+                                            (4,), fx.Float32(s_b_vals[ni]), fx.Float32
+                                        )
+                                    )
                                 current_accs[acc_idx] = math_dialect.fma(
-                                    scaled, s_b_bc, current_accs[acc_idx]
+                                    mfma_result, combined, current_accs[acc_idx]
                                 )
                             else:
                                 # Nothing to scale per block, so chain the MFMAs
