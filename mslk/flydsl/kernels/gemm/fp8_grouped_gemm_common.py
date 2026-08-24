@@ -1545,8 +1545,10 @@ def make_kloop_plain(
     compute_tile,
     lds_base_pong,
     lds_base_b,
+    lds_a_stride,
+    lds_b_stride,
 ):
-    """Single-LDS-buffer K-loop for the plain-B kernel.
+    """Double-buffered K-loop for the plain-B kernel.
 
     Plain B is staged HBM->LDS->registers each K-tile, alongside A. A and B each
     get one LDS buffer rather than the ping-pong pair `make_pingpong_kloop` uses,
@@ -1564,9 +1566,11 @@ def make_kloop_plain(
         a_regs = prefetch_a_tile(0)
         b_regs = prefetch_b_tile(0)
         for kt in range_constexpr(num_k_tiles):
+            a_base = lds_base_pong + fx.Index((kt % 2) * lds_a_stride)
+            b_base = lds_base_b + fx.Index((kt % 2) * lds_b_stride)
             # Publish this tile's A/B (already in VGPRs) to LDS.
-            store_a_tile_to_lds(a_regs, lds_base_pong)
-            store_b_tile_to_lds(b_regs, lds_base_b)
+            store_a_tile_to_lds(a_regs, a_base)
+            store_b_tile_to_lds(b_regs, b_base)
             scales_pf = prefetch_scales(kt)
             gpu.barrier()
 
@@ -1576,10 +1580,10 @@ def make_kloop_plain(
                 b_regs = prefetch_b_tile(kt + 1)
 
             # Read B fragment from LDS, compute the tile.
-            b_tile = load_b_tile_from_lds(lds_base_b)
-            accs = compute_tile(accs, kt, lds_base_pong, b_tile, scales_pf)
-            # Barrier before next iter overwrites the shared A/B buffers.
-            gpu.barrier()
+            b_tile = load_b_tile_from_lds(b_base)
+            accs = compute_tile(accs, kt, a_base, b_tile, scales_pf)
+            if lds_a_stride == 0 or lds_b_stride == 0:
+                gpu.barrier()
         return accs
 
     return run_kloop

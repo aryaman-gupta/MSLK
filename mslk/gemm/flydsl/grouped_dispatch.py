@@ -30,7 +30,13 @@ SCALE_BLOCK = 128
 
 # Default tile when autotuning is disabled. Valid for any supported shape
 # (tile_n = tile_k = 128 divide every supported N/K, including a small N=128).
-DEFAULT_TILE = {"tile_m": 128, "tile_n": 128, "tile_k": 128, "waves_per_eu": 2}
+DEFAULT_TILE = {
+    "tile_m": 128,
+    "tile_n": 128,
+    "tile_k": 128,
+    "waves_per_eu": 2,
+    "b_pingpong": False,
+}
 
 # Candidate tiles swept by autotune. tile_k is a multiple of the K-loop sub-block
 # size under either scheme. Rowwise scaling additionally allows tile_n below the
@@ -53,14 +59,28 @@ _TILE_K = (128, 256)
 # needs 128, which no configuration of this kernel comes close to.
 _WAVES_PER_EU = (0, 2)
 
+# Double-buffering the plain-B LDS tile drops one of the two barriers a K tile
+# costs, in exchange for a second buffer of tile_n * tile_k bytes. At the
+# narrow tile_k that buys a few percent; at the wide one the extra buffer puts
+# the block over the occupancy the waves-per-EU hint asks for and costs 20%.
+# Offer it only where it can pay rather than spending sweep time on the rest.
+_B_PINGPONG_TILE_K = 128
+
 
 def _tiles(tile_ns):
     return tuple(
-        {"tile_m": tm, "tile_n": tn, "tile_k": tk, "waves_per_eu": wpe}
+        {
+            "tile_m": tm,
+            "tile_n": tn,
+            "tile_k": tk,
+            "waves_per_eu": wpe,
+            "b_pingpong": bpp,
+        }
         for tm in _TILE_M
         for tn in tile_ns
         for tk in _TILE_K
         for wpe in _WAVES_PER_EU
+        for bpp in ((False, True) if tk == _B_PINGPONG_TILE_K else (False,))
     )
 
 
@@ -136,6 +156,7 @@ def launch(
     tile_n,
     tile_k,
     waves_per_eu=0,
+    b_pingpong=False,
 ):
     """Compile (cached) and launch the grouped GEMM for one tile config.
 
@@ -185,6 +206,7 @@ def launch(
         blockscale=blockscale,
         layout=layout,
         roll_k=roll_k,
+        b_pingpong=b_pingpong,
         # 0 means the compiler picks.
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
         # Compile the tail-masked variant only when K stops mid-tile, so shapes

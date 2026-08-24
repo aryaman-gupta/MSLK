@@ -118,6 +118,7 @@ def compile_fp8_grouped_gemm(
     k_padding: bool = False,
     n_padding: bool = False,
     roll_k: bool = False,
+    b_pingpong: bool = False,
 ):
     """Compile grouped FP8 GEMM kernel and return the JIT launcher.
 
@@ -266,7 +267,7 @@ def compile_fp8_grouped_gemm(
     else:
         # Plain B needs its own LDS buffer alongside A.
         validate_lds_budget_plain(
-            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, b_pingpong=False, arch=gpu_arch
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, b_pingpong=b_pingpong, arch=gpu_arch
         )
     out_mlir = out_mlir_for(out_dtype)
 
@@ -313,21 +314,25 @@ def compile_fp8_grouped_gemm(
                 tile_n=tile_n,
                 tile_k=tile_k,
                 elem_bytes=elem_bytes,
-                b_pingpong=False,
+                b_pingpong=b_pingpong,
             )
         )
+        # Zero collapses the pair to one buffer, which the K loop reads as a
+        # signal to keep its second barrier.
+        lds_b_stride = tile_n * tile_k if b_pingpong else 0
 
     # Module name for caching
     _variant = "pingpong" if b_preshuffled else "plain"
     _scaling = "blockscale" if blockscale else "rowwise"
     _kpad = "_kpad" if k_padding else ""
     _roll = "_rollk" if roll_k else ""
+    _bpp = "_bpp" if b_pingpong else ""
     _wpe = f"_wpe{int(waves_per_eu)}" if waves_per_eu else ""
     _npad = "_npad" if n_padding else ""
     module_name = (
         f"grouped_gemm_{_scaling}_{layout}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_wpe}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_bpp}{_wpe}"
     ).replace("-", "_")
 
     @flyc.kernel(name=module_name)
@@ -387,7 +392,7 @@ def compile_fp8_grouped_gemm(
                 base_ptr,
                 lds_alloc_offset,
                 T.f8,
-                shape=((lds_b_offset_elems + tile_n * tile_k),),
+                shape=((lds_b_offset_elems + (2 if b_pingpong else 1) * tile_n * tile_k),),
             ).get()
             layout_lds_b = fx.make_layout((tile_n, tile_k), stride=(tile_k, 1))
             lds_base_b = fx.Index(lds_b_offset_elems)
@@ -794,6 +799,8 @@ def compile_fp8_grouped_gemm(
                     compute_tile=compute_tile,
                     lds_base_pong=lds_base_pong,
                     lds_base_b=lds_base_b,
+                    lds_a_stride=lds_tile_elems,
+                    lds_b_stride=lds_b_stride,
                 )
 
             # The ping-pong state is nested (a B tile is k_unroll pairs of
@@ -885,17 +892,21 @@ def compile_fp8_grouped_gemm(
                         _accs = [Vector(v) for v in _st[:_n_acc]]
                         _a_cur = [Vector(v) for v in _st[_n_acc : _n_acc + _n_a]]
                         _b_cur = [Vector(v) for v in _st[_n_acc + _n_a :]]
-                        store_a_tile_to_lds(_a_cur, lds_base_pong)
-                        store_b_tile_to_lds(_b_cur, lds_base_b)
+                        _par = _kt % fx.Index(2)
+                        _a_base = lds_base_pong + _par * fx.Index(lds_tile_elems)
+                        _b_base = lds_base_b + _par * fx.Index(lds_b_stride)
+                        if const_expr(not b_pingpong):
+                            _a_base = lds_base_pong
+                        store_a_tile_to_lds(_a_cur, _a_base)
+                        store_b_tile_to_lds(_b_cur, _b_base)
                         _scales = prefetch_scales(_kt)
                         gpu.barrier()
                         _a_nxt = prefetch_a_tile(_kt + 1)
                         _b_nxt = prefetch_b_tile(_kt + 1)
-                        _b_tile = load_b_tile_from_lds(lds_base_b)
-                        _accs = compute_tile(
-                            _accs, _kt, lds_base_pong, _b_tile, _scales
-                        )
-                        gpu.barrier()
+                        _b_tile = load_b_tile_from_lds(_b_base)
+                        _accs = compute_tile(_accs, _kt, _a_base, _b_tile, _scales)
+                        if const_expr(not b_pingpong):
+                            gpu.barrier()
                         _res = yield list(_accs) + list(_a_nxt) + list(_b_nxt)
                     accs = [Vector(v) for v in _res[:_n_acc]]
                     _a_regs = [Vector(v) for v in _res[_n_acc : _n_acc + _n_a]]
@@ -911,12 +922,17 @@ def compile_fp8_grouped_gemm(
                     )
                 else:
                     _last = num_k_tiles - 1
-                store_a_tile_to_lds(_a_regs, lds_base_pong)
-                store_b_tile_to_lds(_b_regs, lds_base_b)
+                _par_l = fx.Index(_last) % fx.Index(2)
+                _a_base_l = lds_base_pong + _par_l * fx.Index(lds_tile_elems)
+                _b_base_l = lds_base_b + _par_l * fx.Index(lds_b_stride)
+                if const_expr(not b_pingpong):
+                    _a_base_l = lds_base_pong
+                store_a_tile_to_lds(_a_regs, _a_base_l)
+                store_b_tile_to_lds(_b_regs, _b_base_l)
                 _scales = prefetch_scales(_last)
                 gpu.barrier()
-                _b_tile = load_b_tile_from_lds(lds_base_b)
-                accs = compute_tile(accs, _last, lds_base_pong, _b_tile, _scales)
+                _b_tile = load_b_tile_from_lds(_b_base_l)
+                accs = compute_tile(accs, _last, _a_base_l, _b_tile, _scales)
                 gpu.barrier()
             else:
                 accs = run_kloop(accs)
