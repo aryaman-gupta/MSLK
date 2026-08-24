@@ -732,6 +732,10 @@ def compile_fp8_grouped_gemm(
                 sb_per_tile=sb_per_tile,
                 m_repeat=m_repeat,
                 num_acc_n=num_acc_n,
+                blockscale=blockscale,
+                lane_div_16=lane_div_16,
+                group_m_start=fx.Index(group_m_start_i32),
+                group_m_size=fx.Index(group_m_size_i32),
             )
 
             compute_tile = make_compute_tile(

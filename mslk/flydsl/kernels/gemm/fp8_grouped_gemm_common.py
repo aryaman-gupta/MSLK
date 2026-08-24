@@ -1070,8 +1070,12 @@ def make_prefetch_scales(
     m_repeat,
     num_acc_n,
     sa_group_off=None,
+    blockscale=False,
+    lane_div_16=None,
+    group_m_start=None,
+    group_m_size=None,
 ):
-    """Build the cross-tile E8M0 scale prefetch closure (gfx950 HW path).
+    """Build the cross-tile scale prefetch closure.
 
     Returns `prefetch_scales(k_tile_idx_py)` that returns
     `(sa_pf, sb_pf)` — outer index = sb (sb_per_tile), inner =
@@ -1084,7 +1088,61 @@ def make_prefetch_scales(
     pre-extraction code.
     """
 
+    def _load_combined_sw(k_tile_idx_py):
+        """Load a tile's FP32 scales and fold s_a into s_b ahead of the MFMAs.
+
+        Both the loads and the product are loop-invariant work relative to the
+        MFMAs that consume them, so running them a stage early lets the load
+        latency and the multiplies overlap the previous tile instead of
+        standing in front of this one's first MFMA.
+        """
+        all_combined = []
+        for sb in range_constexpr(sb_per_tile):
+            kb = fx.Index(k_tile_idx_py * sb_per_tile + sb)
+            if group_m_start is not None:
+                sa_base = group_m_start * fx.Index(scale_k - 1) + kb * group_m_size
+            elif sa_group_off is None:
+                sa_base = kb * m_in
+            else:
+                sa_base = sa_group_off + kb * m_in
+            row_off_base = lane_div_16 * fx.Index(4)
+            s_a_vecs = []
+            for mi in range_constexpr(m_repeat):
+                s_a_row = []
+                for ii in range_constexpr(4):
+                    row_global = bx_m + (mi * 16) + row_off_base + fx.Index(ii)
+                    s_a_row.append(
+                        buffer_ops.buffer_load(
+                            sa_rsrc, sa_base + row_global, vec_width=1, dtype=T.f32
+                        )
+                    )
+                s_a_vecs.append(Vector.from_elements(s_a_row, fx.Float32))
+
+            sb_group_offset = group_idx * fx.Index(scale_k * scale_n)
+            combined = []
+            for mi in range_constexpr(m_repeat):
+                row = []
+                for ni in range_constexpr(num_acc_n):
+                    sb_idx = (
+                        sb_group_offset
+                        + kb * fx.Index(scale_n)
+                        + n_block_for_scale[ni]
+                    )
+                    s_b_val = rocdl.readfirstlane(
+                        T.f32,
+                        buffer_ops.buffer_load(
+                            sb_rsrc, sb_idx, vec_width=1, dtype=T.f32
+                        ),
+                    )
+                    s_b_bc = Vector.filled((4,), fx.Float32(s_b_val), fx.Float32)
+                    row.append(ArithValue(s_a_vecs[mi]) * ArithValue(s_b_bc))
+                combined.append(row)
+            all_combined.append(combined)
+        return all_combined
+
     def prefetch_scales(k_tile_idx_py):
+        if blockscale and not _use_hw_scale:
+            return _load_combined_sw(k_tile_idx_py)
         if not _use_hw_scale:
             return None
         sa_pf = []
@@ -1181,7 +1239,7 @@ def make_compute_tile(
 
             s_a_vecs = []
             s_b_vals = []
-            if blockscale and not _use_hw_scale:
+            if blockscale and not _use_hw_scale and scales_pf is None:
                 if group_m_start is not None:
                     # quantize_fp8_group(m_sizes=...) stores scale_a as per-group
                     # blocks: group g starts at M_start*scale_k and holds element
@@ -1276,17 +1334,24 @@ def make_compute_tile(
                 # Rowwise scaling has nothing to fold in per block, so the MFMAs
                 # accumulate straight into current_accs.
                 if blockscale:
-                    combined_scales = []
-                    for mi in range_constexpr(m_repeat):
-                        mi_combined = []
-                        for ni in range_constexpr(num_acc_n):
-                            s_b_bc = Vector.filled(
-                                (4,), fx.Float32(s_b_vals[ni]), fx.Float32
-                            )
-                            mi_combined.append(
-                                ArithValue(s_a_vecs[mi]) * ArithValue(s_b_bc)
-                            )
-                        combined_scales.append(mi_combined)
+                    if scales_pf is not None:
+                        # Folded a stage earlier by prefetch_scales.
+                        combined_scales = scales_pf[sb]
+                    else:
+                        # The rolled ping-pong loop cannot carry the folded
+                        # scales through its iteration state, so that path
+                        # still loads and folds them here.
+                        combined_scales = []
+                        for mi in range_constexpr(m_repeat):
+                            mi_combined = []
+                            for ni in range_constexpr(num_acc_n):
+                                s_b_bc = Vector.filled(
+                                    (4,), fx.Float32(s_b_vals[ni]), fx.Float32
+                                )
+                                mi_combined.append(
+                                    ArithValue(s_a_vecs[mi]) * ArithValue(s_b_bc)
+                                )
+                            combined_scales.append(mi_combined)
                     mfma_accs = [acc_init] * (num_acc_n * m_repeat)
                 else:
                     mfma_accs = current_accs
