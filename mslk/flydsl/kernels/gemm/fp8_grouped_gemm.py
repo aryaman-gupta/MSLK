@@ -737,7 +737,13 @@ def compile_fp8_grouped_gemm(
                 sb_per_tile=sb_per_tile,
                 m_repeat=m_repeat,
                 num_acc_n=num_acc_n,
-                blockscale=blockscale,
+                # Only the plain K loop can use folded scales: it hands them
+                # straight from the prefetch to the compute inside one body.
+                # The ping-pong loop carries its stage state through the
+                # rolled loop's iteration arguments, which the folded scales
+                # are too many values to join, so hoisting there would load
+                # them twice rather than once early.
+                blockscale=blockscale and not b_preshuffled,
                 lane_div_16=lane_div_16,
                 group_m_start=fx.Index(group_m_start_i32),
                 group_m_size=fx.Index(group_m_size_i32),
