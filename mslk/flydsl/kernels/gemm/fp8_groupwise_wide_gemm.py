@@ -49,6 +49,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import math as math_dialect
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T, Vector
@@ -431,8 +432,19 @@ def compile_groupwise_wide_gemm(
                 for aj in range_constexpr(acc_n):
                     i = ai * acc_n + aj
                     tile = Vector(tiles[i], (acc_regs,), fx.Float32)
+                    # Emitted as an explicit fused multiply-add. Written as
+                    # `acc + tile * scale` the two arith ops do not contract --
+                    # contraction changes rounding, so the compiler will not do
+                    # it unasked -- and the fold costs a separate v_pk_mul_f32
+                    # and v_pk_add_f32 per pair instead of one v_pk_fma_f32.
                     vals = [
-                        fx.Float32(cur[i][r]) + fx.Float32(tile[r]) * scales[ai]
+                        fx.Float32(
+                            math_dialect.fma(
+                                fx.Float32(tile[r]).ir_value(),
+                                scales[ai].ir_value(),
+                                fx.Float32(cur[i][r]).ir_value(),
+                            )
+                        )
                         for r in range_constexpr(acc_regs)
                     ]
                     out.append(Vector.from_elements(vals, fx.Float32))
