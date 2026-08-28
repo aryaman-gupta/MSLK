@@ -1604,6 +1604,26 @@ def make_pingpong_stages(
     return prologue, pair
 
 
+def make_pingpong_kloop(*, num_k_tiles, **stage_kwargs):
+    """Build a ping-pong K-loop driver that walks every K tile.
+
+    Returns ``run_kloop(accs)``, which advances ``accs`` through all K tiles
+    using the prologue and per-pair body of :func:`make_pingpong_stages`,
+    unrolled at compile time. For callers that want the loop rolled instead,
+    drive those stages directly: the rolled construct is AST-rewritten and so
+    can only be written in the kernel function's own source.
+    """
+    prologue, pair = make_pingpong_stages(num_k_tiles=num_k_tiles, **stage_kwargs)
+
+    def run_kloop(accs):
+        state = prologue()
+        for k_pair in range_constexpr(0, num_k_tiles, 2):
+            accs, state = pair(accs, k_pair, state)
+        return accs
+
+    return run_kloop
+
+
 def make_epilogue_writers(
     *,
     accs,
