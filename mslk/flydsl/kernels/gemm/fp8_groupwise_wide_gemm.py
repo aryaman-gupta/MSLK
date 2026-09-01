@@ -562,31 +562,66 @@ def compile_groupwise_wide_gemm(
         accs = split_state(_res)
 
         # ---- epilogue --------------------------------------------------------
-        # The transposed accumulator gives a lane one output row and four runs of
-        # four adjacent columns, so each run converts to four BF16 and leaves as
-        # one 8-byte store. No LDS round trip and no cross-lane shuffle: the
-        # layout the MFMA produced is already the layout the store wants.
+        # The transposed accumulator leaves a lane holding one output row and
+        # four runs of four adjacent columns, with lanes L and L+32 holding
+        # complementary halves of the same eight columns. Stored as-is that caps
+        # the store at 8 bytes per lane, which fills only an eighth of a cache
+        # line per transaction -- fine when the operands dominate, expensive when
+        # the output does.
+        #
+        # `permlane32_swap(a, b)` gathers both half-wave halves of one operand
+        # into one half-wave: low lanes receive a[L] and a[L+32], high lanes
+        # receive b[L-32] and b[L]. Feeding it a pair of column groups therefore
+        # gives the low half all eight columns of the even group and the high
+        # half all eight of the odd one, both for the row the lane already owned.
+        # Two swaps per pair of groups turn four 8-byte stores into two 16-byte
+        # ones, which is what Triton's sixteen permlanes buy it as well.
+        pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+
+        def group_dwords(acc, g):
+            """One column group's four values, as BF16 packed into two i32."""
+            packed = Vector.from_elements(
+                [
+                    fx.BFloat16(arith.trunc_f(T.bf16, fx.Float32(acc[g * 4 + e])))
+                    for e in range_constexpr(4)
+                ],
+                fx.BFloat16,
+            ).bitcast(fx.Int32)
+            return fx.Int32(packed[0]), fx.Int32(packed[1])
+
         for ai in range_constexpr(acc_m):
             row = bx_m + wave_m0 + fx.Index(ai * MFMA_M) + lane_lo
             for aj in range_constexpr(acc_n):
                 acc = accs[ai * acc_n + aj]
-                for g in range_constexpr(acc_regs // 4):
+                for pair in range_constexpr(acc_regs // 8):
+                    even_lo, even_hi = group_dwords(acc, 2 * pair)
+                    odd_lo, odd_hi = group_dwords(acc, 2 * pair + 1)
+                    sw_lo = rocdl.permlane32_swap(
+                        pair_ty, _raw(even_lo), _raw(odd_lo), False, False
+                    )
+                    sw_hi = rocdl.permlane32_swap(
+                        pair_ty, _raw(even_hi), _raw(odd_hi), False, False
+                    )
+                    # Columns ascend with the address, so the dwords interleave:
+                    # this lane's own pair, then its partner's.
+                    quad = Vector.from_elements(
+                        [
+                            fx.Int32(llvm.extractvalue(T.i32, sw_lo, [0])),
+                            fx.Int32(llvm.extractvalue(T.i32, sw_hi, [0])),
+                            fx.Int32(llvm.extractvalue(T.i32, sw_lo, [1])),
+                            fx.Int32(llvm.extractvalue(T.i32, sw_hi, [1])),
+                        ],
+                        fx.Int32,
+                    )
+                    # Low lanes take the even group, high lanes the odd one.
                     col = (
                         by_n
                         + wave_n0
                         + fx.Index(aj * MFMA_N)
-                        + lane_hi * c4
-                        + fx.Index(g * 8)
-                    )
-                    quad = Vector.from_elements(
-                        [
-                            fx.BFloat16(arith.trunc_f(T.bf16, fx.Float32(acc[g * 4 + e])))
-                            for e in range_constexpr(4)
-                        ],
-                        fx.BFloat16,
+                        + (fx.Index(2 * pair) + lane_hi) * fx.Index(8)
                     )
                     buffer_ops.buffer_store(
-                        quad.bitcast(fx.Int32),
+                        quad,
                         d_rsrc,
                         (row * n_in + col) * fx.Index(2),
                         offset_is_bytes=True,
