@@ -53,6 +53,7 @@ def default_epilog(
     arith,
     range_constexpr,
     m_repeat: int,
+    m_wave_base=None,
     lane_div_16,
     bx_m,
     body_row: Callable,
@@ -85,6 +86,7 @@ def default_epilog(
 
 def c_shuffle_epilog(
     *,
+    m_wave_base=None,
     arith,
     vector,
     gpu,
@@ -237,6 +239,8 @@ def c_shuffle_epilog(
         _precomputed_rows_s = []
         for mr in range_constexpr(m_reps_s):
             row_base_m = arith.constant(mr * CShuffleMLane_s, index=True)
+            if m_wave_base is not None:
+                row_base_m = row_base_m + m_wave_base
             row_local = row_base_m + m_lane_s
             row = bx_m_v + row_local
             row_ctx_raw = (
@@ -362,6 +366,8 @@ def c_shuffle_epilog(
     _precomputed_rows = []
     for mr in range_constexpr(m_reps_shuffle):
         row_base_m = arith.constant(mr * CShuffleMLane, index=True)
+        if m_wave_base is not None:
+            row_base_m = row_base_m + m_wave_base
         row_local = row_base_m + m_lane
         row = bx_m_v + row_local
 
@@ -420,6 +426,7 @@ def c_shuffle_epilog(
 def mfma_epilog(
     *,
     use_cshuffle: bool,
+    m_wave_base=None,
     # Common (always required)
     arith,
     range_constexpr,
@@ -452,6 +459,7 @@ def mfma_epilog(
         if body_row is None:
             raise ValueError("mfma_epilog(use_cshuffle=False) requires `body_row`.")
         return default_epilog(
+            m_wave_base=m_wave_base,
             arith=arith,
             range_constexpr=range_constexpr,
             m_repeat=m_repeat,
@@ -461,6 +469,7 @@ def mfma_epilog(
         )
 
     return c_shuffle_epilog(
+        m_wave_base=m_wave_base,
         arith=arith,
         vector=vector,
         gpu=gpu,

@@ -872,6 +872,18 @@ def make_b_tile_loaders(
     )
 
 
+def _mfma_row_off(mi, m_wave_base):
+    """Tile-local row of MFMA sub-tile ``mi``, shifted to this wave's M slab.
+
+    With a one-dimensional wave grid every wave spans the whole of tile_m and the
+    offset is nothing, so this stays a plain Python int and the emitted IR is
+    unchanged. A two-dimensional grid gives each wave a slab of the rows, and the
+    base becomes a runtime value.
+    """
+    off = mi * 16
+    return off if m_wave_base is None else off + m_wave_base
+
+
 def make_lds_loader(*, lds_a, layout_lds, k_blocks16):
     """Build the LDS-side A K64 pack loader.
 
@@ -1055,6 +1067,7 @@ def make_hot_loop_scheduler(
 
 def make_prefetch_scales(
     *,
+    m_wave_base=None,
     _use_hw_scale,
     sa_rsrc,
     sb_rsrc,
@@ -1110,7 +1123,7 @@ def make_prefetch_scales(
             for mi in range_constexpr(m_repeat):
                 s_a_row = []
                 for ii in range_constexpr(4):
-                    row_global = bx_m + (mi * 16) + row_off_base + fx.Index(ii)
+                    row_global = bx_m + _mfma_row_off(mi, m_wave_base) + row_off_base + fx.Index(ii)
                     s_a_row.append(
                         buffer_ops.buffer_load(
                             sa_rsrc, sa_base + row_global, vec_width=1, dtype=T.f32
@@ -1158,7 +1171,7 @@ def make_prefetch_scales(
 
             sa_sb = []
             for mi in range_constexpr(m_repeat):
-                sa_row = bx_m + (mi * 16) + lane_mod_16
+                sa_row = bx_m + _mfma_row_off(mi, m_wave_base) + lane_mod_16
                 sa_idx = sa_base_pf + sa_row
                 sa_i8 = buffer_ops.buffer_load(sa_rsrc, sa_idx, vec_width=1, dtype=T.i8)
                 sa_e8m0 = ArithValue(sa_i8).extui(T.i32)
@@ -1182,6 +1195,7 @@ def make_prefetch_scales(
 
 def make_compute_tile(
     *,
+    m_wave_base=None,
     _use_hw_scale,
     _is_gfx950=False,
     lds_load_packs_k64,
@@ -1257,7 +1271,7 @@ def make_compute_tile(
                 for mi in range_constexpr(m_repeat):
                     s_a_row = []
                     for ii in range_constexpr(4):
-                        row_in_tile = (mi * 16) + row_off_base + fx.Index(ii)
+                        row_in_tile = _mfma_row_off(mi, m_wave_base) + row_off_base + fx.Index(ii)
                         row_global = bx_m + row_in_tile
                         sa_idx = sa_base + row_global
                         s_a_val = buffer_ops.buffer_load(
@@ -1293,7 +1307,7 @@ def make_compute_tile(
                 col_base1 = col_offset_base_bytes + fx.Index(ku1 * 64)
 
                 for mi in range_constexpr(m_repeat):
-                    curr_row_a_lds = lane_mod_16 + (mi * 16)
+                    curr_row_a_lds = lane_mod_16 + _mfma_row_off(mi, m_wave_base)
                     if a0_prefetch is not None and sb == 0 and mi == 0:
                         a0, a1 = a0_prefetch
                     else:
@@ -1363,7 +1377,7 @@ def make_compute_tile(
                 col_base1 = col_offset_base_bytes + fx.Index(ku1 * 64)
 
                 for mi in range_constexpr(m_repeat):
-                    curr_row_a_lds = lane_mod_16 + (mi * 16)
+                    curr_row_a_lds = lane_mod_16 + _mfma_row_off(mi, m_wave_base)
                     if a0_prefetch is not None and sb == 0 and mi == 0:
                         a0, a1 = a0_prefetch
                     else:
@@ -1415,7 +1429,7 @@ def make_compute_tile(
                         ):
                             a0, a1 = a0_prefetch
                         else:
-                            row_a_lds = lane_mod_16 + (mi * 16)
+                            row_a_lds = lane_mod_16 + _mfma_row_off(mi, m_wave_base)
                             col_a_base_bytes = lane_div_16 * fx.Index(16) + fx.Index(
                                 k_offset_bytes
                             )
@@ -1467,6 +1481,7 @@ def make_compute_tile(
 
 def make_rowwise_scaler(
     *,
+    m_wave_base=None,
     sa_rsrc,
     sb_rsrc,
     group_idx,
@@ -1505,7 +1520,7 @@ def make_rowwise_scaler(
         for mi in range_constexpr(m_repeat):
             s_a_row = []
             for ii in range_constexpr(4):
-                row_global = bx_m + (mi * 16) + row_off_base + fx.Index(ii)
+                row_global = bx_m + _mfma_row_off(mi, m_wave_base) + row_off_base + fx.Index(ii)
                 s_a_row.append(
                     buffer_ops.buffer_load(
                         sa_rsrc, row_global, vec_width=1, dtype=T.f32
@@ -1794,15 +1809,18 @@ MfmaTilingConstants = namedtuple(
 )
 
 
-def compute_mfma_tiling(*, tile_m, tile_n):
+def compute_mfma_tiling(*, tile_m, tile_n, waves_m=1, waves_n=4):
     """Pure-Python derivation of the MFMA tiling constants.
 
     Returns an `MfmaTilingConstants` namedtuple with `m_repeat`,
     `num_waves`, `n_per_wave`, `num_acc_n`, `num_accs`. Emits no MLIR.
     """
-    m_repeat = tile_m // 16  # 8 for tile_m=128
-    num_waves = 4
-    n_per_wave = tile_n // num_waves  # 32 for tile_n=128
+    # Waves tile the output as waves_m x waves_n. LDS read traffic per unit work
+    # is waves_m / tile_m + waves_n / tile_n, minimised when the wave grid is
+    # proportioned like the tile; the historical 1 x 4 split cannot do that.
+    num_waves = waves_m * waves_n
+    m_repeat = (tile_m // waves_m) // 16
+    n_per_wave = tile_n // waves_n
     num_acc_n = n_per_wave // 16  # 2 for n_per_wave=32
     num_accs = m_repeat * num_acc_n
     return MfmaTilingConstants(
@@ -1837,6 +1855,7 @@ NBlockCoords = namedtuple(
 
 def make_n_block_coords(
     *,
+    waves_n=4,
     wave_id,
     by_n,
     group_idx,
@@ -1859,8 +1878,8 @@ def make_n_block_coords(
     namedtuple matching the original local variable names so the caller
     can keep referring to them unchanged.
     """
-    wave_mod_4 = wave_id % fx.Index(4)
-    n_tile_base = wave_mod_4 * fx.Index(n_per_wave)
+    wave_n_idx = wave_id % fx.Index(waves_n)
+    n_tile_base = wave_n_idx * fx.Index(n_per_wave)
 
     c_scale_block_n = fx.Index(scale_block_n)
     c_scale_k = fx.Index(scale_k)
