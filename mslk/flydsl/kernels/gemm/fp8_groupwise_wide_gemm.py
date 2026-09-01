@@ -49,9 +49,11 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import math as math_dialect
+from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
@@ -79,6 +81,28 @@ LOAD_BYTES = 16
 
 # LDS per workgroup on gfx950.
 LDS_CAPACITY = 160 * 1024
+
+# Alias scopes telling the backend that the direct-to-LDS transfers and the MFMA
+# fragment reads never need a dependence inferred between them.
+#
+# `buffer_load_lds` writes LDS through an opaque pointer, so SIInsertWaitcnts
+# cannot see which bytes it touches and conservatively drains every transfer
+# with a vmcnt(0) before each ds_read -- which cancels exactly the overlap the
+# pipeline exists to create. Read literally these two op classes *do* alias:
+# the transfer issued in one iteration is consumed by the reads in the next.
+# What the metadata asserts is not disjointness but that the dependence is
+# carried explicitly, by the s_waitcnt and barrier at the top of the loop body.
+# Triton states the same thing the same way, in a domain it documents as
+# "aliasing information between AsyncCopyGlobalToLocal, BufferLoadToLocal and
+# LocalLoad ops".
+#
+# Because this suppresses the compiler's own analysis, that s_waitcnt becomes
+# load-bearing for correctness rather than just for speed: too permissive a wait
+# now reads LDS before the transfer lands, silently. The one-tile-deep pipeline
+# keeps it at vmcnt(0), the maximally conservative value, so there is no count
+# to get wrong.
+_LDS_DOMAIN = '#llvm.alias_scope_domain<id = "gw_wide.lds">'
+_SCOPE_NAMES = ("dma", "reads")
 
 # LDS buffers per operand. Triton runs three, fed by a direct global-to-LDS DMA
 # so the depth costs only LDS. That route is closed here: `buffer_load_lds`
@@ -278,25 +302,6 @@ def compile_groupwise_wide_gemm(
         a_coords = stage_coords(num_a_loads)
         b_coords = stage_coords(num_b_loads)
 
-        k_dwords = k_in // c4
-        tile_k_dwords = fx.Index(tile_k // 4)
-
-        def load_tile(rsrc, coords, row_base, kt):
-            """Read this thread's share of a tile from global into registers.
-
-            Reads past the last tile fall outside the buffer descriptor and come
-            back as zero, so the K tail needs no branch.
-            """
-            parts = []
-            for i in range_constexpr(len(coords)):
-                row, col = coords[i]
-                idx_dw = (row_base + row) * k_dwords + kt * tile_k_dwords + col // c4
-                parts.append(
-                    Vector(
-                        buffer_ops.buffer_load(rsrc, idx_dw, vec_width=4, dtype=T.i32)
-                    ).bitcast(fx.Int32)
-                )
-            return parts
 
         def lds_index(row, col, lds_base):
             """Byte offset of tile element ``(row, col)`` under the XOR16 swizzle.
@@ -307,15 +312,89 @@ def compile_groupwise_wide_gemm(
             """
             return row * fx.Index(tile_k) + swizzle_xor16(row, col, c_chunks) + lds_base
 
-        def store_tile(parts, coords, lds_base):
+        _scopes = [
+            ir.Attribute.parse(
+                f'#llvm.alias_scope<id = "gw_wide.{nm}", domain = {_LDS_DOMAIN}>'
+            )
+            for nm in _SCOPE_NAMES
+        ]
+
+        def tag_alias(op, mine):
+            """Claim scope ``mine`` for ``op`` and disclaim the other one."""
+            op = getattr(op, "owner", op)
+            op.attributes["alias_scopes"] = ir.ArrayAttr.get([_scopes[mine]])
+            op.attributes["noalias_scopes"] = ir.ArrayAttr.get(
+                [sc for i, sc in enumerate(_scopes) if i != mine]
+            )
+
+        lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
+        lds_addr_i32 = fx.Int32(
+            arith.index_cast(
+                T.i32, memref_dialect.extract_aligned_pointer_as_index(lds_a)
+            )
+        )
+        lds_addr_base = fx.Int64(
+            arith.index_cast(
+                T.i64, memref_dialect.extract_aligned_pointer_as_index(lds_a)
+            )
+        )
+
+        def dma_tile(rsrc, coords, row_base, kt, lds_base):
+            """Move a tile from global straight into LDS, never touching a VGPR.
+
+            The destination is not ours to choose: lane L of a wave lands at a
+            fixed ``lds_ptr + L * 16``, so LDS fills linearly and the XOR swizzle
+            moves to the *source* address instead. That is sound because the
+            swizzle is an XOR and so its own inverse -- reading
+            ``global(row, swizzle(row, col))`` into the linear slot for
+            ``(row, col)`` leaves LDS holding what a swizzled store would have
+            written, which is what the fragment reads expect.
+            """
+            ptr = None
             for i in range_constexpr(len(coords)):
                 row, col = coords[i]
-                idx = lds_index(row, col, lds_base)
-                vector.store(vector.bitcast(T.f8x16, parts[i]), lds_a, [idx])
+                byte_off = (
+                    (row_base + row) * k_in
+                    + kt * fx.Index(tile_k)
+                    + swizzle_xor16(row, col, c_chunks)
+                )
+                if i == 0:
+                    ptr = rocdl.readfirstlane(
+                        T.i64,
+                        lds_addr_base
+                        + fx.Int64(lds_base)
+                        + fx.Int64(wave_id * fx.Index(WAVE * LOAD_BYTES)),
+                    )
+                else:
+                    ptr = ptr + fx.Int64(total_threads * LOAD_BYTES)
+                tag_alias(
+                    rocdl.raw_ptr_buffer_load_lds(
+                        rsrc,
+                        llvm.inttoptr(lds_ptr_ty, ptr),
+                        fx.Int32(LOAD_BYTES),
+                        fx.Int32(byte_off),
+                        fx.Int32(0),
+                        fx.Int32(0),
+                        fx.Int32(1),
+                    ),
+                    0,
+                )
+
+        def dma_stage(kt, slot):
+            dma_tile(a_rsrc, a_coords, bx_m, kt, a_buf(slot))
+            dma_tile(b_rsrc, b_coords, by_n, kt, b_buf(slot))
+
 
         # ---- fragment reads --------------------------------------------------
+        v4i32 = ir.VectorType.get([4], fx.Int32.ir_type)
+
         def read_frag(row, lds_base, ks):
-            """Gather one lane's 32-byte operand fragment for MFMA step ``ks``."""
+            """Gather one lane's 32-byte operand fragment for MFMA step ``ks``.
+
+            Issued as an LLVM load rather than a memref one so it can carry the
+            alias metadata; `vector.load` has nowhere to put it, and the
+            attributes would be dropped on the way down.
+            """
             halves = []
             for j in range_constexpr(frag_loads):
                 col = (
@@ -324,7 +403,12 @@ def compile_groupwise_wide_gemm(
                     + fx.Index(j * LOAD_BYTES)
                 )
                 idx = lds_index(row, col, lds_base)
-                halves.append(Vector(Vector.load(T.f8x16, lds_a, [idx])).bitcast(fx.Int32))
+                ptr = llvm.inttoptr(
+                    lds_ptr_ty, (lds_addr_i32 + fx.Int32(idx)).ir_value()
+                )
+                ld = llvm.LoadOp(v4i32, ptr, alignment=16)
+                tag_alias(ld, 1)
+                halves.append(Vector(ld.result))
             return Vector(halves[0]).shuffle(Vector(halves[1]), list(range(8))).ir_value()
 
         def mfma(a_op, b_op, c_in):
@@ -420,11 +504,7 @@ def compile_groupwise_wide_gemm(
 
         def split_state(state):
             vals = list(state) if isinstance(state, (list, tuple)) else [state]
-            return (
-                [Vector(v, (acc_regs,), fx.Float32) for v in vals[:n_acc]],
-                [Vector(v) for v in vals[n_acc : n_acc + num_a_loads]],
-                [Vector(v) for v in vals[n_acc + num_a_loads :]],
-            )
+            return [Vector(v, (acc_regs,), fx.Float32) for v in vals]
 
         def fold(cur, tiles, scales):
             out = []
@@ -452,32 +532,34 @@ def compile_groupwise_wide_gemm(
 
         accs = [Vector(zero_acc, (acc_regs,), fx.Float32) for _ in range_constexpr(n_acc)]
 
-        a_pre = load_tile(a_rsrc, a_coords, bx_m, fx.Index(0))
-        b_pre = load_tile(b_rsrc, b_coords, by_n, fx.Index(0))
+        # One-deep DMA pipeline. Nothing is staged in registers, so the
+        # accumulators are the only loop carry -- 64 values instead of the 88 the
+        # register path needs.
+        #
+        # Ordering matters more than it looks. The wait and barrier come first:
+        # the wait publishes tile kt (whose DMA was issued last iteration) and,
+        # because nothing newer has been issued yet at that point, vmcnt(0) there
+        # is free. The barrier additionally releases slot (kt+1) % STAGES, which
+        # the reads of two iterations ago finished with, so the DMA below may
+        # overwrite it. Only then is the next tile's DMA issued, and it stays in
+        # flight underneath this tile's MFMAs -- which is the entire point, and
+        # also the reason a conservative vmcnt before those reads would undo it.
+        dma_stage(fx.Index(0), fx.Index(0))
 
-        for _kt, _st in fx.range(
-            0, num_k_tiles, 1, init=list(accs) + list(a_pre) + list(b_pre)
-        ):
-            _cur, _a_cur, _b_cur = split_state(_st)
+        for _kt, _st in fx.range(0, num_k_tiles, 1, init=list(accs)):
+            _cur = split_state(_st)
             _now = _kt % fx.Index(STAGES)
-            _a_now, _b_now = a_buf(_now), b_buf(_now)
+            _next_slot = (_kt + fx.Index(1)) % fx.Index(STAGES)
 
-            store_tile(_a_cur, a_coords, _a_now)
-            store_tile(_b_cur, b_coords, _b_now)
+            rocdl.s_waitcnt(0)
             gpu.barrier()
 
-            # Issued after the barrier so they are in flight underneath this
-            # tile's MFMAs; the compiler pipelines them on register dependences
-            # it can see, which is the thing the opaque DMA denied it.
-            _a_next = load_tile(a_rsrc, a_coords, bx_m, _kt + fx.Index(1))
-            _b_next = load_tile(b_rsrc, b_coords, by_n, _kt + fx.Index(1))
+            dma_stage(_kt + fx.Index(1), _next_slot)
 
-            _tiles = tile_product(_a_now, _b_now)
-            _res = yield fold(
-                _cur, _tiles, load_scales(_kt)
-            ) + list(_a_next) + list(_b_next)
+            _tiles = tile_product(a_buf(_now), b_buf(_now))
+            _res = yield fold(_cur, _tiles, load_scales(_kt))
 
-        accs, _, _ = split_state(_res)
+        accs = split_state(_res)
 
         # ---- epilogue --------------------------------------------------------
         # The transposed accumulator gives a lane one output row and four runs of
