@@ -128,6 +128,8 @@ def compile_fp8_grouped_gemm(
     scale_block_k: int = 128,
     scale_block_n: int = 128,
     out_dtype: str = "bf16",
+    waves_m: int = 1,
+    waves_n: int = 4,
     waves_per_eu: int | None = None,
     b_preshuffled: bool = True,
     in_dtype: str = "fp8",
@@ -146,6 +148,16 @@ def compile_fp8_grouped_gemm(
         tile_m: M tile size (default 128)
         tile_n: N tile size (default 128)
         tile_k: K tile size (default 128)
+        waves_m: Waves dividing the tile's rows (default 1).
+        waves_n: Waves dividing the tile's columns (default 4). The block is
+            waves_m * waves_n * 64 threads and each wave owns a
+            (tile_m / waves_m) x (tile_n / waves_n) slab of the output tile.
+            Each wave reads its whole slab's worth of both operands out of LDS,
+            so reads per unit work go as waves_m / tile_m + waves_n / tile_n,
+            which a grid proportioned like the tile minimises: at a square tile
+            2x2 reads a fifth less than the 1x4 default, while at 64x128 the two
+            are equal. Raising the product past 4 buys more waves per tile
+            rather than a better shape, and costs the register budget.
         scale_block_k: K-dimension scale block size (default 128)
         scale_block_n: N-dimension scale block size (default 128)
         out_dtype: Output data type ("bf16" or "f16")
@@ -258,6 +270,17 @@ def compile_fp8_grouped_gemm(
         # boundary, which validate_params checks below.
         n_padding = True
 
+    # The wave grid has to cut the tile into whole 16x16 MFMA tiles, since a
+    # wave's accumulators are counted in them and cannot straddle a boundary.
+    if waves_m < 1 or waves_n < 1:
+        raise ValueError(f"wave grid must be positive, got {waves_m}x{waves_n}")
+    if tile_m % (waves_m * 16) or tile_n % (waves_n * 16):
+        raise ValueError(
+            f"tile {tile_m}x{tile_n} does not divide into a {waves_m}x{waves_n} "
+            "wave grid of whole 16x16 MFMA tiles"
+        )
+    num_waves = waves_m * waves_n
+
     gpu_arch = get_hip_arch()
     # This FP8 kernel always uses the FP32 software-scaling path; the shared
     # helpers' hardware E8M0 microscaling path is not used here.
@@ -302,6 +325,7 @@ def compile_fp8_grouped_gemm(
         k_padding=k_padding,
         in_dtype=in_dtype,
         scaling=scaling,
+        num_waves=num_waves,
     )
     # Check the LDS budget before tracing: the compiler treats an overflow as a
     # hard error that kills the process, which an autotuner cannot skip. Capacity
@@ -371,13 +395,24 @@ def compile_fp8_grouped_gemm(
     _roll = "_rollk" if roll_k else ""
     _wpe = f"_wpe{int(waves_per_eu)}" if waves_per_eu else ""
     _npad = "_npad" if n_padding else ""
+    # The wave grid changes the emitted kernel, so it has to reach the name or a
+    # second grid over the same tile would collide in the JIT cache.
+    _wg = f"_w{waves_m}x{waves_n}" if (waves_m, waves_n) != (1, 4) else ""
     module_name = (
         f"grouped_gemm_{in_dtype}_{_scaling}_{layout}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_wpe}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_wpe}{_wg}"
     ).replace("-", "_")
 
-    @flyc.kernel(name=module_name)
+    # The AMDGPU default caps a workgroup at 256 threads, so a grid of more than
+    # four waves has to declare its size up front. Below that the bound is
+    # already right, and declaring it anyway would perturb register allocation
+    # on every existing configuration for no reason.
+    _kernel_attrs = (
+        {"known_block_size": [total_threads, 1, 1]} if total_threads > 256 else {}
+    )
+
+    @flyc.kernel(name=module_name, **_kernel_attrs)
     def fp8_grouped_gemm_kernel(
         arg_d: fx.Tensor,
         arg_a: fx.Tensor,
@@ -405,11 +440,20 @@ def compile_fp8_grouped_gemm(
         # N-block position; bx_m (global row base) is loaded from the tile map below.
         by_n = by * fx.Index(tile_n)
 
-        # Wave/lane decomposition (256 threads = 4 waves x 64 lanes)
-        layout_wave_lane = fx.make_layout((4, 64), stride=(64, 1))
+        # Wave/lane decomposition (total_threads = num_waves x 64 lanes)
+        layout_wave_lane = fx.make_layout((num_waves, 64), stride=(64, 1))
         coord_wave_lane = fx.idx2crd(fx.Int32(tx), layout_wave_lane)
         wave_id = fx.get(coord_wave_lane, 0)
         lane_id = fx.get(coord_wave_lane, 1)
+
+        # Wave grid: wave w owns rows [wm * tile_m / waves_m, +tile_m / waves_m)
+        # and, via n_tile_base below, the matching slab of columns. A 1 x waves_n
+        # grid leaves every wave spanning the whole of tile_m, and the row
+        # derivations then take no offset at all.
+        if const_expr(waves_m > 1):
+            m_wave_base = (wave_id // fx.Index(waves_n)) * fx.Index(tile_m // waves_m)
+        else:
+            m_wave_base = None
 
         # Lane decomposition for MFMA (lane_id -> lane_div_16, lane_mod_16)
         layout_lane16 = fx.make_layout((4, 16), stride=(16, 1))
@@ -627,7 +671,9 @@ def compile_fp8_grouped_gemm(
                 k_base_div4 = None
                 k_bound = None
 
-            _t = compute_mfma_tiling(tile_m=tile_m, tile_n=tile_n)
+            _t = compute_mfma_tiling(
+                tile_m=tile_m, tile_n=tile_n, waves_m=waves_m, waves_n=waves_n
+            )
             m_repeat = _t.m_repeat
             n_per_wave = _t.n_per_wave
             num_acc_n = _t.num_acc_n
@@ -635,6 +681,7 @@ def compile_fp8_grouped_gemm(
             acc_init, accs = init_accumulators(_t.num_accs)
 
             _nb = make_n_block_coords(
+                waves_n=waves_n,
                 wave_id=wave_id,
                 by_n=by_n,
                 group_idx=group_idx,
@@ -702,6 +749,8 @@ def compile_fp8_grouped_gemm(
 
             # Base coordinates for A0 prefetch (mi=0, ku=0)
             row_a_lds_base = lane_mod_16  # mi=0
+            if const_expr(m_wave_base is not None):
+                row_a_lds_base = row_a_lds_base + m_wave_base
             col_offset_base_bytes = lane_div_16 * fx.Index(16)  # ku=0
 
             # ---- B load path: preshuffled (HBM->registers) vs plain (HBM->LDS->registers) ----
@@ -778,6 +827,7 @@ def compile_fp8_grouped_gemm(
                 )
 
             prefetch_scales = make_prefetch_scales(
+                m_wave_base=m_wave_base,
                 _use_hw_scale=_use_hw_scale,
                 sa_rsrc=sa_rsrc,
                 sb_rsrc=sb_rsrc,
@@ -795,6 +845,7 @@ def compile_fp8_grouped_gemm(
             )
 
             compute_tile = make_compute_tile(
+                m_wave_base=m_wave_base,
                 _use_hw_scale=_use_hw_scale,
                 _is_gfx950=_is_gfx950,
                 lds_load_packs_k64=lds_load_packs_k64,
@@ -982,6 +1033,7 @@ def compile_fp8_grouped_gemm(
                 # Rowwise scales are constant along K, so the whole reduction is
                 # scaled here in one pass rather than per K tile.
                 accs = make_rowwise_scaler(
+                    m_wave_base=m_wave_base,
                     sa_rsrc=sa_rsrc,
                     sb_rsrc=sb_rsrc,
                     group_idx=group_idx,
@@ -1026,6 +1078,7 @@ def compile_fp8_grouped_gemm(
 
             mfma_epilog(
                 use_cshuffle=True,
+                m_wave_base=m_wave_base,
                 arith=arith,
                 vector=vector,
                 gpu=gpu,
@@ -1034,6 +1087,7 @@ def compile_fp8_grouped_gemm(
                 tile_m=tile_m,
                 tile_n=tile_n,
                 e_vec=e_vec,
+                block_size=total_threads,
                 m_repeat=m_repeat,
                 num_acc_n=num_acc_n,
                 tx=tx,

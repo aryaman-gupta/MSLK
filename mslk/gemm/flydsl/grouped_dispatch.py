@@ -163,6 +163,8 @@ def launch(
     tile_m,
     tile_n,
     tile_k,
+    waves_m=1,
+    waves_n=4,
     waves_per_eu=0,
 ):
     """Compile (cached) and launch the grouped GEMM for one tile config.
@@ -209,6 +211,8 @@ def launch(
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,
+        waves_m=waves_m,
+        waves_n=waves_n,
         scale_block_k=SCALE_BLOCK,
         scale_block_n=SCALE_BLOCK,
         out_dtype="bf16",

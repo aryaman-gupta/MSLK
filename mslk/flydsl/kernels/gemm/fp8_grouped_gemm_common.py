@@ -328,6 +328,7 @@ def compute_compile_constants(
     k_padding=False,
     in_dtype="fp8",
     scaling=SCALING_ROW,
+    num_waves=4,
 ):
     """Compute the compile-time scalar constants shared by both kernels.
 
@@ -341,7 +342,9 @@ def compute_compile_constants(
         raise ValueError(
             f"in_dtype must be one of {tuple(ELEM_BYTES)}, got {in_dtype!r}"
         )
-    total_threads = 256
+    # The block is one wave per SIMD lane group, so the staging split below
+    # follows the wave count rather than a fixed 256.
+    total_threads = num_waves * 64
     elem_bytes = ELEM_BYTES[in_dtype]
     # With k_padding the last tile is only partly covered by K; it still runs, with
     # its out-of-range loads masked to zero, which contribute nothing to the sum.
@@ -1040,7 +1043,8 @@ def make_plain_b_tile(
     N-row addressing must match what the MFMA B operand expects, i.e. the same
     N-column `make_n_block_coords` uses (common.py):
         col = by_n + n_tile_base + ni*16 + lane_mod_16
-    where `n_tile_base = wave_mod_4 * n_per_wave` is this WAVE's N sub-range.
+    where `n_tile_base = (wave_id % waves_n) * n_per_wave` is this WAVE's N
+    sub-range.
     Since the B LDS buffer holds the block's [tile_n, tile_k] tile (row 0 = the
     block's `by_n`), the LDS N-row for accumulator `ni` is the tile-LOCAL row
     `n_tile_base + ni*16 + lane_mod_16` (by_n is the tile base, already 0 in the
