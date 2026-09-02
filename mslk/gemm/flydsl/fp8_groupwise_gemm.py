@@ -13,11 +13,18 @@ weights are scaled per 128x128 block and whose activations are scaled per token
 per 128 of K. CUDA implements it in CUTLASS; on ROCm it was a Triton kernel,
 which this replaces.
 
-It is served by the same kernel as the grouped ops, compiled for a single group
-under the ``batched`` layout: that layout gives each group a fixed slab of rows,
-so one group is one slab spanning all of M, which is a plain GEMM. The scale
-layouts coincide too. Block scaling addresses scale_a as per-group blocks --
-group g's block starts at ``m_start * scale_k`` and holds element
+Two kernels serve it, chosen by architecture.
+
+On gfx950 it is a kernel written for this op alone, built around instructions
+that architecture introduced -- the wide ``f8f6f4`` MFMA and ``permlane32_swap``
+-- and around the fact that a plain GEMM needs no group resolution at all. See
+``mslk.flydsl.kernels.gemm.fp8_groupwise_wide_gemm``.
+
+Everywhere else it is the same kernel as the grouped ops, compiled for a single
+group under the ``batched`` layout: that layout gives each group a fixed slab of
+rows, so one group is one slab spanning all of M, which is a plain GEMM. The
+scale layouts coincide too. Block scaling addresses scale_a as per-group blocks
+-- group g's block starts at ``m_start * scale_k`` and holds element
 ``(local_m, k_block)`` at ``local_m + k_block * M_g`` -- and at one group that is
 ``local_m + k_block * M``, which is exactly the ``[K//128, M]`` this op is
 handed. Likewise ``[G, K//128, N//128]`` is ``[K//128, N//128]`` at G = 1.
@@ -33,10 +40,85 @@ Tensor contract:
                   * WQ[n, k] * w_scale[k//128, n//128]
 """
 
+import functools
+from collections.abc import Callable
+
 import torch
 from mslk.gemm.flydsl import grouped_dispatch
+from mslk.utils.device import is_gfx942, is_gfx950
 
 _SCALE_BLOCK = grouped_dispatch.SCALE_BLOCK
+
+
+def _matmul_gfx942(XQ, WQ, x_scale, w_scale, M, N, K):
+    """Serve the op from the grouped GEMM kernel, as one batched group."""
+    # One group owning every row, so the weights become the single-entry stack
+    # the kernel indexes by group. The view is free on a contiguous tensor.
+    return grouped_dispatch.dispatch(
+        XQ,
+        WQ.unsqueeze(0),
+        x_scale,
+        w_scale,
+        grouped_dispatch.unused_group_meta(XQ.device),
+        b_preshuffled=False,
+        blockscale=True,
+        layout="batched",
+    )
+
+
+def _matmul_gfx950(XQ, WQ, x_scale, w_scale, M, N, K):
+    """Serve the op from the kernel written for it.
+
+    The tile and wave grid are left at the kernel's defaults until they are
+    swept: which one wins is a per-shape question, and a hand-written ladder
+    would only be a guess to unpick later.
+    """
+    from mslk.flydsl.jit import run_compiled
+    from mslk.flydsl.kernels.gemm.fp8_groupwise_wide_gemm import (
+        compile_groupwise_wide_gemm,
+    )
+
+    launcher = compile_groupwise_wide_gemm(n=N, k=K, tile_k=_SCALE_BLOCK)
+    # The grid covers every row and column of the output, so nothing is left
+    # unwritten and the buffer does not have to start zeroed.
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
+    # The kernel addresses the operands as flat byte buffers; FP8 is viewed as
+    # int8 for the handoff, as the grouped path does.
+    run_compiled(
+        launcher,
+        out,
+        XQ.contiguous().view(torch.int8),
+        WQ.contiguous().view(torch.int8),
+        x_scale.contiguous(),
+        w_scale.contiguous(),
+        M,
+        N,
+        K,
+        torch.cuda.current_stream(),
+    )
+    return out
+
+
+@functools.lru_cache(maxsize=1)
+def _kernel() -> Callable[..., torch.Tensor]:
+    """Which kernel serves this op on the current GPU.
+
+    Named architectures rather than "gfx950 or else": FlyDSL reports itself
+    available on the RDNA parts too, which have no MFMA at all, and falling
+    through to a kernel built on one would fail somewhere deep inside it.
+
+    Resolved once rather than per call: the architecture cannot change within a
+    process, and reading it costs a device-property lookup that dwarfs a tensor
+    attribute access.
+    """
+    if is_gfx950():
+        return _matmul_gfx950
+    if is_gfx942():
+        return _matmul_gfx942
+    raise RuntimeError(
+        "mslk::f8f8bf16_groupwise on ROCm is implemented for gfx942 and gfx950; "
+        "this GPU is neither."
+    )
 
 
 def matmul_f8f8bf16_groupwise(
@@ -67,18 +149,7 @@ def matmul_f8f8bf16_groupwise(
         f"w_scale must be [{scale_k}, {scale_n}], got {tuple(w_scale.shape)}"
     )
 
-    # One group owning every row, so the weights become the single-entry stack
-    # the kernel indexes by group. The view is free on a contiguous tensor.
-    return grouped_dispatch.dispatch(
-        XQ,
-        WQ.unsqueeze(0),
-        x_scale,
-        w_scale,
-        grouped_dispatch.unused_group_meta(XQ.device),
-        b_preshuffled=False,
-        blockscale=True,
-        layout="batched",
-    )
+    return _kernel()(XQ, WQ, x_scale, w_scale, M, N, K)
 
 
 # This module deliberately does not register the op. FlyDSL owns it wherever it
