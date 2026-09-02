@@ -55,7 +55,6 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
     buffer_ops,
-    const_expr,
     gpu,
     range_constexpr,
     rocdl,
@@ -66,9 +65,13 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import swizzle_xor16
 
-# Bytes each lane supplies per operand per MFMA issue (32 FP8 = 8 i32), the same
-# for either shape this kernel can be built with.
+# MFMA geometry: one issue is a 32x32 output tile contracting 64 of K.
+MFMA_M = 32
+MFMA_K = 64
+# Bytes each lane supplies per operand per issue (32 FP8 = 8 i32).
 MFMA_OPERAND_BYTES = 32
+# Accumulator registers per MFMA tile.
+ACC_REGS = MFMA_M * MFMA_M // 64
 
 WAVE = 64
 
@@ -123,7 +126,6 @@ def compile_groupwise_wide_gemm(
     waves_m: int = 4,
     waves_n: int = 2,
     waves_per_eu: int | None = None,
-    wide_mfma: bool = True,
 ):
     """Compile the kernel for one shape and tile config; return the launcher.
 
@@ -132,19 +134,7 @@ def compile_groupwise_wide_gemm(
     a wave count because its proportions drive LDS read traffic: reads per unit
     work are ``waves_m / tile_m + waves_n / tile_n``, which a grid proportioned
     like the tile minimises.
-
-    ``wide_mfma`` selects the MFMA shape. Both 32x32x64 and 16x16x128 retire the
-    same MACs from the same 32-byte operands and need the same accumulator
-    registers for a given tile, and both are neutral-scaled; the wide one does it
-    in half the issues, and is the only one whose epilogue can gather a lane's
-    columns into a 16-byte store.
     """
-    mfma_m = 32 if wide_mfma else 16
-    mfma_k = 64 if wide_mfma else 128
-    lane_groups = WAVE // mfma_m        # lane // mfma_m selects the K quarter/half
-    # Accumulator registers per MFMA tile: 16 wide, 4 narrow.
-    acc_regs = mfma_m * mfma_m // WAVE
-
     if tile_k != SCALE_BLOCK:
         raise ValueError(
             f"tile_k ({tile_k}) must equal the scale block ({SCALE_BLOCK}): the "
@@ -158,13 +148,13 @@ def compile_groupwise_wide_gemm(
         )
     if n % SCALE_BLOCK:
         raise ValueError(f"n ({n}) must be a multiple of {SCALE_BLOCK}")
-    if tile_m % (waves_m * mfma_m) or tile_n % (waves_n * mfma_m):
+    if tile_m % (waves_m * MFMA_M) or tile_n % (waves_n * MFMA_M):
         raise ValueError(
             f"tile {tile_m}x{tile_n} does not divide into {waves_m}x{waves_n} "
-            f"waves of {mfma_m}x{mfma_m} MFMA tiles"
+            f"waves of {MFMA_M}x{MFMA_M} MFMA tiles"
         )
-    if tile_k % mfma_k:
-        raise ValueError(f"tile_k ({tile_k}) must be a multiple of {mfma_k}")
+    if tile_k % MFMA_K:
+        raise ValueError(f"tile_k ({tile_k}) must be a multiple of {MFMA_K}")
     if tile_n > SCALE_BLOCK:
         raise ValueError(
             f"tile_n ({tile_n}) must not exceed the scale block ({SCALE_BLOCK}), "
@@ -176,9 +166,9 @@ def compile_groupwise_wide_gemm(
     wave_tile_m = tile_m // waves_m
     wave_tile_n = tile_n // waves_n
     # MFMA tiles each wave owns, and hence its accumulator count.
-    acc_m = wave_tile_m // mfma_m
-    acc_n = wave_tile_n // mfma_m
-    k_steps = tile_k // mfma_k
+    acc_m = wave_tile_m // MFMA_M
+    acc_n = wave_tile_n // MFMA_M
+    k_steps = tile_k // MFMA_K
     num_k_tiles = k // tile_k
     scale_n = n // SCALE_BLOCK
 
@@ -219,13 +209,12 @@ def compile_groupwise_wide_gemm(
     allocator.ptr = lds_off + lds_bytes
 
     # Everything that changes the emitted kernel has to reach the name, or two
-    # configs would collide in the compile cache. The occupancy hint and the
-    # MFMA shape do, as much as the tile does.
+    # configs would collide in the compile cache. The occupancy hint does, as
+    # much as the tile and the wave grid do.
     _wpe = f"_wpe{int(waves_per_eu)}" if waves_per_eu else ""
-    _mfma = "" if wide_mfma else "_narrow"
     module_name = (
         f"gw_wide_n{n}_k{k}_t{tile_m}x{tile_n}x{tile_k}"
-        f"_w{waves_m}x{waves_n}{_wpe}{_mfma}"
+        f"_w{waves_m}x{waves_n}{_wpe}"
     )
 
     # The AMDGPU default caps a workgroup at 256 threads; an eight-wave block
@@ -242,7 +231,7 @@ def compile_groupwise_wide_gemm(
         i32_k: fx.Int32,
     ):
         # MLIR types need a live context, so they are built during tracing.
-        v_acc_ty = Vector.make_type(acc_regs, fx.Float32)
+        v_acc_ty = Vector.make_type(ACC_REGS, fx.Float32)
 
         m_in = fx.Index(i32_m)
         n_in = fx.Index(i32_n)
@@ -263,8 +252,8 @@ def compile_groupwise_wide_gemm(
         wn = wave_id % fx.Index(waves_n)
         # The wide MFMA splits a lane's role by half-wave: which 32 of K it
         # supplies, and which four of the 32 output rows it holds.
-        lane_lo = lane % fx.Index(mfma_m)
-        lane_hi = lane // fx.Index(mfma_m)
+        lane_lo = lane % fx.Index(MFMA_M)
+        lane_hi = lane // fx.Index(MFMA_M)
 
         wave_m0 = wm * fx.Index(wave_tile_m)
         wave_n0 = wn * fx.Index(wave_tile_n)
@@ -410,7 +399,7 @@ def compile_groupwise_wide_gemm(
             halves = []
             for j in range_constexpr(frag_loads):
                 col = (
-                    fx.Index(ks * mfma_k)
+                    fx.Index(ks * MFMA_K)
                     + lane_hi * fx.Index(32)
                     + fx.Index(j * LOAD_BYTES)
                 )
@@ -424,17 +413,18 @@ def compile_groupwise_wide_gemm(
             return Vector(halves[0]).shuffle(Vector(halves[1]), list(range(8))).ir_value()
 
         def mfma(a_op, b_op, c_in):
-            ops = [
+            # The scale operands are the neutral exponent, so the instruction's
+            # own block scaling is the identity and the FP32 scales are folded in
+            # afterwards instead.
+            return rocdl.mfma_scale_f32_32x32x64_f8f6f4(
+                v_acc_ty,
                 _raw(a_op), _raw(b_op), _raw(c_in),
                 0, 0, 0,
                 _raw(fx.Int32(NEUTRAL_E8M0)), 0, _raw(fx.Int32(NEUTRAL_E8M0)),
-            ]
-            if const_expr(wide_mfma):
-                return rocdl.mfma_scale_f32_32x32x64_f8f6f4(v_acc_ty, *ops).result
-            return rocdl.mfma_scale_f32_16x16x128_f8f6f4(v_acc_ty, ops)
+            ).result
 
         zero_acc = Vector.from_elements(
-            [fx.Float32(0.0) for _ in range_constexpr(acc_regs)], fx.Float32
+            [fx.Float32(0.0) for _ in range_constexpr(ACC_REGS)], fx.Float32
         ).ir_value()
 
         def tile_product(a_base, b_base):
@@ -448,11 +438,11 @@ def compile_groupwise_wide_gemm(
             for ks in range_constexpr(k_steps):
                 a_frags = []
                 for ai in range_constexpr(acc_m):
-                    row = wave_m0 + fx.Index(ai * mfma_m) + lane_lo
+                    row = wave_m0 + fx.Index(ai * MFMA_M) + lane_lo
                     a_frags.append(read_frag(row, a_base, ks))
                 b_frags = []
                 for aj in range_constexpr(acc_n):
-                    row = wave_n0 + fx.Index(aj * mfma_m) + lane_lo
+                    row = wave_n0 + fx.Index(aj * MFMA_M) + lane_lo
                     b_frags.append(read_frag(row, b_base, ks))
                 for ai in range_constexpr(acc_m):
                     for aj in range_constexpr(acc_n):
@@ -483,7 +473,7 @@ def compile_groupwise_wide_gemm(
             )
             out = []
             for ai in range_constexpr(acc_m):
-                row = bx_m + wave_m0 + fx.Index(ai * mfma_m) + lane_lo
+                row = bx_m + wave_m0 + fx.Index(ai * MFMA_M) + lane_lo
                 sa = fx.Float32(
                     buffer_ops.buffer_load(
                         sa_rsrc, kt * m_in + row, vec_width=1, dtype=T.f32
@@ -497,14 +487,14 @@ def compile_groupwise_wide_gemm(
 
         def split_state(state):
             vals = list(state) if isinstance(state, (list, tuple)) else [state]
-            return [Vector(v, (acc_regs,), fx.Float32) for v in vals]
+            return [Vector(v, (ACC_REGS,), fx.Float32) for v in vals]
 
         def fold(cur, tiles, scales):
             out = []
             for ai in range_constexpr(acc_m):
                 for aj in range_constexpr(acc_n):
                     i = ai * acc_n + aj
-                    tile = Vector(tiles[i], (acc_regs,), fx.Float32)
+                    tile = Vector(tiles[i], (ACC_REGS,), fx.Float32)
                     # Emitted as an explicit fused multiply-add. Written as
                     # `acc + tile * scale` the two arith ops do not contract --
                     # contraction changes rounding, so the compiler will not do
@@ -518,12 +508,12 @@ def compile_groupwise_wide_gemm(
                                 fx.Float32(cur[i][r]).ir_value(),
                             )
                         )
-                        for r in range_constexpr(acc_regs)
+                        for r in range_constexpr(ACC_REGS)
                     ]
                     out.append(Vector.from_elements(vals, fx.Float32))
             return out
 
-        accs = [Vector(zero_acc, (acc_regs,), fx.Float32) for _ in range_constexpr(n_acc)]
+        accs = [Vector(zero_acc, (ACC_REGS,), fx.Float32) for _ in range_constexpr(n_acc)]
 
         # One tile deep: tile kt is read out of LDS while tile kt+1 is in flight
         # towards the other slot. Both operands go straight from global memory to
@@ -592,62 +582,42 @@ def compile_groupwise_wide_gemm(
             return fx.Int32(packed[0]), fx.Int32(packed[1])
 
         for ai in range_constexpr(acc_m):
-            row = bx_m + wave_m0 + fx.Index(ai * mfma_m) + lane_lo
+            row = bx_m + wave_m0 + fx.Index(ai * MFMA_M) + lane_lo
             for aj in range_constexpr(acc_n):
                 acc = accs[ai * acc_n + aj]
-                if const_expr(wide_mfma):
-                    for pair in range_constexpr(acc_regs // 8):
-                        even_lo, even_hi = group_dwords(acc, 2 * pair)
-                        odd_lo, odd_hi = group_dwords(acc, 2 * pair + 1)
-                        sw_lo = rocdl.permlane32_swap(
-                            pair_ty, _raw(even_lo), _raw(odd_lo), False, False
-                        )
-                        sw_hi = rocdl.permlane32_swap(
-                            pair_ty, _raw(even_hi), _raw(odd_hi), False, False
-                        )
-                        # Columns ascend with the address, so the dwords
-                        # interleave: this lane's own pair, then its partner's.
-                        quad = Vector.from_elements(
-                            [
-                                fx.Int32(llvm.extractvalue(T.i32, sw_lo, [0])),
-                                fx.Int32(llvm.extractvalue(T.i32, sw_hi, [0])),
-                                fx.Int32(llvm.extractvalue(T.i32, sw_lo, [1])),
-                                fx.Int32(llvm.extractvalue(T.i32, sw_hi, [1])),
-                            ],
-                            fx.Int32,
-                        )
-                        # Low lanes take the even group, high lanes the odd one.
-                        col = (
-                            by_n
-                            + wave_n0
-                            + fx.Index(aj * mfma_m)
-                            + (fx.Index(2 * pair) + lane_hi) * fx.Index(8)
-                        )
-                        buffer_ops.buffer_store(
-                            quad,
-                            d_rsrc,
-                            (row * n_in + col) * fx.Index(2),
-                            offset_is_bytes=True,
-                        )
-                else:
-                    # The narrow shape splits the wave four ways rather than two,
-                    # so a single permlane32_swap cannot gather eight adjacent
-                    # columns into one lane. Store the four it already holds.
-                    for g in range_constexpr(acc_regs // 4):
-                        lo, hi = group_dwords(acc, g)
-                        col = (
-                            by_n
-                            + wave_n0
-                            + fx.Index(aj * mfma_m)
-                            + lane_hi * fx.Index(4)
-                            + fx.Index(g * 4 * lane_groups)
-                        )
-                        buffer_ops.buffer_store(
-                            Vector.from_elements([lo, hi], fx.Int32),
-                            d_rsrc,
-                            (row * n_in + col) * fx.Index(2),
-                            offset_is_bytes=True,
-                        )
+                for pair in range_constexpr(ACC_REGS // 8):
+                    even_lo, even_hi = group_dwords(acc, 2 * pair)
+                    odd_lo, odd_hi = group_dwords(acc, 2 * pair + 1)
+                    sw_lo = rocdl.permlane32_swap(
+                        pair_ty, _raw(even_lo), _raw(odd_lo), False, False
+                    )
+                    sw_hi = rocdl.permlane32_swap(
+                        pair_ty, _raw(even_hi), _raw(odd_hi), False, False
+                    )
+                    # Columns ascend with the address, so the dwords interleave:
+                    # this lane's own pair, then its partner's.
+                    quad = Vector.from_elements(
+                        [
+                            fx.Int32(llvm.extractvalue(T.i32, sw_lo, [0])),
+                            fx.Int32(llvm.extractvalue(T.i32, sw_hi, [0])),
+                            fx.Int32(llvm.extractvalue(T.i32, sw_lo, [1])),
+                            fx.Int32(llvm.extractvalue(T.i32, sw_hi, [1])),
+                        ],
+                        fx.Int32,
+                    )
+                    # Low lanes take the even group, high lanes the odd one.
+                    col = (
+                        by_n
+                        + wave_n0
+                        + fx.Index(aj * MFMA_M)
+                        + (fx.Index(2 * pair) + lane_hi) * fx.Index(8)
+                    )
+                    buffer_ops.buffer_store(
+                        quad,
+                        d_rsrc,
+                        (row * n_in + col) * fx.Index(2),
+                        offset_is_bytes=True,
+                    )
 
     @flyc.jit
     def launch_groupwise_wide_gemm(
