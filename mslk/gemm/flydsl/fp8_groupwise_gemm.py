@@ -51,14 +51,14 @@ from mslk.utils.device import is_gfx942, is_gfx950
 
 _SCALE_BLOCK = grouped_dispatch.SCALE_BLOCK
 
-# Default config when autotuning is disabled: the kernel's own defaults, which
-# every supported shape can take, since tile_n divides the scale block and the
-# op's contract already makes N and K multiples of it.
+# Config used when autotuning is disabled. Picked for the smallest worst case
+# against the per-shape best, not the most wins, so an untuned caller has a
+# bounded loss. Legal for every supported shape.
 DEFAULT_TILE = {
-    "tile_m": 256,
-    "tile_n": 128,
+    "tile_m": 128,
+    "tile_n": 64,
     "waves_m": 4,
-    "waves_n": 2,
+    "waves_n": 1,
     "waves_per_eu": 0,
 }
 

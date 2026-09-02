@@ -120,11 +120,11 @@ def compile_groupwise_wide_gemm(
     *,
     n: int,
     k: int,
-    tile_m: int = 256,
-    tile_n: int = 128,
+    tile_m: int = 128,
+    tile_n: int = 64,
     tile_k: int = 128,
     waves_m: int = 4,
-    waves_n: int = 2,
+    waves_n: int = 1,
     waves_per_eu: int | None = None,
 ):
     """Compile the kernel for one shape and tile config; return the launcher.
