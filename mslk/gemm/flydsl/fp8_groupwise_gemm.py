@@ -8,10 +8,11 @@
 
 """FP8 groupwise-scaled GEMM via FlyDSL.
 
-Registers ``mslk::f8f8bf16_groupwise``, the plain (non-grouped) GEMM whose
+Implements ``mslk::f8f8bf16_groupwise``, the plain (non-grouped) GEMM whose
 weights are scaled per 128x128 block and whose activations are scaled per token
-per 128 of K. CUDA implements it in CUTLASS; on ROCm it was a Triton kernel,
-which this replaces.
+per 128 of K. CUDA implements it in CUTLASS. The op is registered in
+``mslk/gemm/__init__.py``, which picks this implementation wherever the FlyDSL
+backend is opted into and Triton's otherwise.
 
 Two kernels serve it, chosen by architecture.
 
@@ -20,11 +21,11 @@ that architecture introduced -- the wide ``f8f6f4`` MFMA and ``permlane32_swap``
 -- and around the fact that a plain GEMM needs no group resolution at all. See
 ``mslk.flydsl.kernels.gemm.fp8_groupwise_wide_gemm``.
 
-Everywhere else it is the same kernel as the grouped ops, compiled for a single
-group under the ``batched`` layout: that layout gives each group a fixed slab of
-rows, so one group is one slab spanning all of M, which is a plain GEMM. The
-scale layouts coincide too. Block scaling addresses scale_a as per-group blocks
--- group g's block starts at ``m_start * scale_k`` and holds element
+On gfx942 it is the same kernel as the grouped ops, compiled for a single group
+under the ``batched`` layout: that layout gives each group a fixed slab of rows,
+so one group is one slab spanning all of M, which is a plain GEMM. The scale
+layouts coincide too. Block scaling addresses scale_a as per-group blocks --
+group g's block starts at ``m_start * scale_k`` and holds element
 ``(local_m, k_block)`` at ``local_m + k_block * M_g`` -- and at one group that is
 ``local_m + k_block * M``, which is exactly the ``[K//128, M]`` this op is
 handed. Likewise ``[G, K//128, N//128]`` is ``[K//128, N//128]`` at G = 1.

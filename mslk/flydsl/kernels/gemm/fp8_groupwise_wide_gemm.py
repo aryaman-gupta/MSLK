@@ -17,8 +17,7 @@ Computes ``D[M, N] = dequant(A) @ dequant(B).T`` for
 
 which is the contract of ``mslk::f8f8bf16_groupwise``.
 
-The schedule mirrors what the ROCm Triton kernel compiles to on gfx950, so that
-the two can be compared instruction for instruction:
+The schedule:
 
   * ``v_mfma_scale_f32_32x32x64_f8f6f4`` with a neutral E8M0 scale, which makes
     the hardware block-scaling a no-op and lets the block-scaled instruction
@@ -34,7 +33,7 @@ the two can be compared instruction for instruction:
     afterwards, because a scale changes every 128 elements of K while the
     accumulator has to persist across the whole contraction.
 
-Fragment layouts for the wide MFMA (verified empirically, not assumed):
+Fragment layouts for the wide MFMA:
 
   A operand   m = lane % 32,  k = (lane // 32) * 32 + byte
   B operand   n = lane % 32,  k = (lane // 32) * 32 + byte
@@ -67,11 +66,8 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import swizzle_xor16
 
-# Wide MFMA geometry: one issue is a 32x32 output tile contracting 64 of K.
-MFMA_M = 32
-MFMA_N = 32
-MFMA_K = 64
-# Bytes each lane supplies per operand per issue (32 FP8 = 8 i32).
+# Bytes each lane supplies per operand per MFMA issue (32 FP8 = 8 i32), the same
+# for either shape this kernel can be built with.
 MFMA_OPERAND_BYTES = 32
 
 WAVE = 64
@@ -95,13 +91,10 @@ LDS_CAPACITY = 160 * 1024
 # `buffer_load_lds` writes LDS through an opaque pointer, so SIInsertWaitcnts
 # cannot see which bytes it touches and conservatively drains every transfer
 # with a vmcnt(0) before each ds_read -- which cancels exactly the overlap the
-# pipeline exists to create. Read literally these two op classes *do* alias:
-# the transfer issued in one iteration is consumed by the reads in the next.
-# What the metadata asserts is not disjointness but that the dependence is
-# carried explicitly, by the s_waitcnt and barrier at the top of the loop body.
-# Triton states the same thing the same way, in a domain it documents as
-# "aliasing information between AsyncCopyGlobalToLocal, BufferLoadToLocal and
-# LocalLoad ops".
+# pipeline exists to create. Read literally these two op classes *do* alias: the
+# transfer issued in one iteration is consumed by the reads in the next. What
+# the metadata asserts is not disjointness but that the dependence is carried
+# explicitly, by the s_waitcnt and barrier at the top of the loop body.
 #
 # Because this suppresses the compiler's own analysis, that s_waitcnt becomes
 # load-bearing for correctness rather than just for speed: too permissive a wait
@@ -110,16 +103,12 @@ LDS_CAPACITY = 160 * 1024
 # to get wrong.
 _LDS_DOMAIN = '#llvm.alias_scope_domain<id = "gw_wide.lds">'
 _SCOPE_NAMES = ("dma", "reads")
+_SCOPE_DMA, _SCOPE_READS = range(len(_SCOPE_NAMES))
 
-# LDS buffers per operand. Triton runs three, fed by a direct global-to-LDS DMA
-# so the depth costs only LDS. That route is closed here: `buffer_load_lds`
-# writes LDS opaquely, so SIInsertWaitcnts cannot prove the pending transfers do
-# not alias the fragment reads and drains them with a vmcnt(0) before every
-# ds_read -- an explicit vmcnt(9) comes back out of the assembler as vmcnt(0).
-# The instruction mix still matches Triton exactly; only the wait operands
-# differ, and it measured 20% slower. Staging through registers instead lets the
-# compiler pipeline on register dependences it can see, but then each extra
-# stage costs a whole tile of VGPRs as well as the LDS, which is why two wins.
+# LDS buffers per operand: one being filled by the next tile's transfer while the
+# other is read by this tile's MFMAs. A deeper pipeline would need an exact
+# vmcnt rather than the vmcnt(0) above, which the alias metadata makes
+# load-bearing for correctness; see the K loop.
 STAGES = 2
 
 
@@ -139,18 +128,22 @@ def compile_groupwise_wide_gemm(
     """Compile the kernel for one shape and tile config; return the launcher.
 
     ``waves_m``/``waves_n`` are the wave grid, so the block is
-    ``waves_m * waves_n * 64`` threads. Triton reaches the same place by picking
-    ``num_warps`` and letting the compiler choose the grid; here it is explicit,
-    since the grid shape drives LDS read traffic and cannot be left implicit.
+    ``waves_m * waves_n * 64`` threads. The grid is given as a shape rather than
+    a wave count because its proportions drive LDS read traffic: reads per unit
+    work are ``waves_m / tile_m + waves_n / tile_n``, which a grid proportioned
+    like the tile minimises.
+
+    ``wide_mfma`` selects the MFMA shape. Both 32x32x64 and 16x16x128 retire the
+    same MACs from the same 32-byte operands and need the same accumulator
+    registers for a given tile, and both are neutral-scaled; the wide one does it
+    in half the issues, and is the only one whose epilogue can gather a lane's
+    columns into a 16-byte store.
     """
-    # 32x32x64 and 16x16x128 retire the same MACs from the same 32-byte operands
-    # and need the same accumulator registers for a given tile; the wide one just
-    # does it in half the issues. Both are neutral-scaled, so this selects the
-    # shape, not the technique.
     mfma_m = 32 if wide_mfma else 16
     mfma_k = 64 if wide_mfma else 128
-    lane_groups = WAVE // mfma_m          # lane // mfma_m selects the K quarter/half
-    acc_regs_v = mfma_m * mfma_m // WAVE  # 16 wide, 4 narrow
+    lane_groups = WAVE // mfma_m        # lane // mfma_m selects the K quarter/half
+    # Accumulator registers per MFMA tile: 16 wide, 4 narrow.
+    acc_regs = mfma_m * mfma_m // WAVE
 
     if tile_k != SCALE_BLOCK:
         raise ValueError(
@@ -161,7 +154,7 @@ def compile_groupwise_wide_gemm(
     if k % tile_k or n % tile_n:
         raise ValueError(
             f"n ({n}) and k ({k}) must divide by tile_n ({tile_n}) and tile_k "
-            f"({tile_k}); the tail-masked variant is not built yet"
+            f"({tile_k}); this kernel does not mask a partial tile"
         )
     if n % SCALE_BLOCK:
         raise ValueError(f"n ({n}) must be a multiple of {SCALE_BLOCK}")
@@ -202,8 +195,6 @@ def compile_groupwise_wide_gemm(
 
     # 16-byte chunks per row, the modulus of the XOR swizzle.
     k_chunks = tile_k // LOAD_BYTES
-    # Accumulator registers per MFMA tile.
-    acc_regs = acc_regs_v
     # 16-byte reads per operand fragment.
     frag_loads = MFMA_OPERAND_BYTES // LOAD_BYTES
 
@@ -309,8 +300,8 @@ def compile_groupwise_wide_gemm(
 
         def b_buf(slot):
             return fx.Index(STAGES * lds_a_elems) + slot * fx.Index(lds_b_elems)
+
         c_chunks = fx.Index(k_chunks)
-        c4 = fx.Index(4)
 
         # ---- staging coordinates -------------------------------------------
         # Load i of thread tx covers tile bytes [(i * threads + tx) * 16, +16),
@@ -324,7 +315,6 @@ def compile_groupwise_wide_gemm(
 
         a_coords = stage_coords(num_a_loads)
         b_coords = stage_coords(num_b_loads)
-
 
         def lds_index(row, col, lds_base):
             """Byte offset of tile element ``(row, col)`` under the XOR16 swizzle.
@@ -400,13 +390,12 @@ def compile_groupwise_wide_gemm(
                         fx.Int32(0),
                         fx.Int32(1),
                     ),
-                    0,
+                    _SCOPE_DMA,
                 )
 
         def dma_stage(kt, slot):
             dma_tile(a_rsrc, a_coords, bx_m, kt, a_buf(slot))
             dma_tile(b_rsrc, b_coords, by_n, kt, b_buf(slot))
-
 
         # ---- fragment reads --------------------------------------------------
         v4i32 = ir.VectorType.get([4], fx.Int32.ir_type)
@@ -430,7 +419,7 @@ def compile_groupwise_wide_gemm(
                     lds_ptr_ty, (lds_addr_i32 + fx.Int32(idx)).ir_value()
                 )
                 ld = llvm.LoadOp(v4i32, ptr, alignment=16)
-                tag_alias(ld, 1)
+                tag_alias(ld, _SCOPE_READS)
                 halves.append(Vector(ld.result))
             return Vector(halves[0]).shuffle(Vector(halves[1]), list(range(8))).ir_value()
 
@@ -504,21 +493,6 @@ def compile_groupwise_wide_gemm(
             return out
 
         # ---- K loop ----------------------------------------------------------
-        # Software pipeline, STAGES - 1 tiles deep, with nothing staged in
-        # registers: each iteration waits for the tile whose DMA was issued
-        # STAGES - 1 iterations ago, barriers, then issues the DMA for the tile
-        # STAGES - 1 ahead and computes.
-        #
-        # The one barrier does double duty. It publishes the tile just waited
-        # for, and it separates the reads of slot (kt - 1) % STAGES -- which the
-        # DMA below is about to overwrite -- from that overwrite, because those
-        # reads happened before it in every wave's program order.
-        #
-        # The scale loads are issued *before* the DMA rather than with the fold
-        # that consumes them. vmcnt retires in order, so consuming a scale
-        # loaded in the same iteration would force a wait that also drained
-        # every DMA behind it, collapsing the pipeline to nothing. Loading them
-        # two tiles ahead puts them behind the DMAs in the queue instead.
         n_acc = acc_m * acc_n
 
         def split_state(state):
@@ -551,18 +525,27 @@ def compile_groupwise_wide_gemm(
 
         accs = [Vector(zero_acc, (acc_regs,), fx.Float32) for _ in range_constexpr(n_acc)]
 
-        # One-deep DMA pipeline. Nothing is staged in registers, so the
-        # accumulators are the only loop carry -- 64 values instead of the 88 the
-        # register path needs.
+        # One tile deep: tile kt is read out of LDS while tile kt+1 is in flight
+        # towards the other slot. Both operands go straight from global memory to
+        # LDS, so the accumulators are the only value the loop carries.
         #
-        # Ordering matters more than it looks. The wait and barrier come first:
-        # the wait publishes tile kt (whose DMA was issued last iteration) and,
-        # because nothing newer has been issued yet at that point, vmcnt(0) there
-        # is free. The barrier additionally releases slot (kt+1) % STAGES, which
-        # the reads of two iterations ago finished with, so the DMA below may
-        # overwrite it. Only then is the next tile's DMA issued, and it stays in
-        # flight underneath this tile's MFMAs -- which is the entire point, and
-        # also the reason a conservative vmcnt before those reads would undo it.
+        # The order of the four steps in the body is forced, and each pairing
+        # matters:
+        #
+        #   wait    publishes tile kt, whose transfer was issued last iteration.
+        #           Nothing newer has been issued at this point, so vmcnt(0) here
+        #           costs nothing and there is no count to get wrong -- which the
+        #           alias metadata makes a correctness property, not just a
+        #           performance one.
+        #   barrier must follow the wait, or a wave crosses it with transfers
+        #           still in flight and its partners read bytes it has not
+        #           written; s_barrier orders execution, not memory. It also
+        #           releases the slot the previous iteration finished reading,
+        #           which the transfer below is about to overwrite.
+        #   DMA     must follow the barrier, or it overwrites a slot the other
+        #           waves are still reading.
+        #   compute leaves that transfer in flight underneath this tile's MFMAs,
+        #           which is the whole purpose of the arrangement.
         dma_stage(fx.Index(0), fx.Index(0))
 
         for _kt, _st in fx.range(0, num_k_tiles, 1, init=list(accs)):
@@ -594,7 +577,7 @@ def compile_groupwise_wide_gemm(
         # gives the low half all eight columns of the even group and the high
         # half all eight of the odd one, both for the row the lane already owned.
         # Two swaps per pair of groups turn four 8-byte stores into two 16-byte
-        # ones, which is what Triton's sixteen permlanes buy it as well.
+        # ones.
         pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
 
         def group_dwords(acc, g):
