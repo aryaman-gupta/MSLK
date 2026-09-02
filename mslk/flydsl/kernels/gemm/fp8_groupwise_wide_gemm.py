@@ -536,6 +536,10 @@ def compile_groupwise_wide_gemm(
         #           waves are still reading.
         #   compute leaves that transfer in flight underneath this tile's MFMAs,
         #           which is the whole purpose of the arrangement.
+        #
+        # The scale loads sit with the fold that consumes them. Hoisting them
+        # above the transfer, which would leave the fold waiting behind fewer
+        # outstanding loads, measures slower at every tile tried.
         dma_stage(fx.Index(0), fx.Index(0))
 
         for _kt, _st in fx.range(0, num_k_tiles, 1, init=list(accs)):
