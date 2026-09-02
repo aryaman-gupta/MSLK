@@ -227,8 +227,14 @@ def compile_groupwise_wide_gemm(
     lds_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_off + lds_bytes
 
+    # Everything that changes the emitted kernel has to reach the name, or two
+    # configs would collide in the compile cache. The occupancy hint and the
+    # MFMA shape do, as much as the tile does.
+    _wpe = f"_wpe{int(waves_per_eu)}" if waves_per_eu else ""
+    _mfma = "" if wide_mfma else "_narrow"
     module_name = (
-        f"gw_wide_n{n}_k{k}_t{tile_m}x{tile_n}x{tile_k}_w{waves_m}x{waves_n}"
+        f"gw_wide_n{n}_k{k}_t{tile_m}x{tile_n}x{tile_k}"
+        f"_w{waves_m}x{waves_n}{_wpe}{_mfma}"
     )
 
     # The AMDGPU default caps a workgroup at 256 threads; an eight-wave block

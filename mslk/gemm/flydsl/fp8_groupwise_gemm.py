@@ -44,10 +44,58 @@ import functools
 from collections.abc import Callable
 
 import torch
+from mslk.flydsl.autotune import next_pow2, prune_by_divisibility, tunable
 from mslk.gemm.flydsl import grouped_dispatch
 from mslk.utils.device import is_gfx942, is_gfx950
 
 _SCALE_BLOCK = grouped_dispatch.SCALE_BLOCK
+
+# Default config when autotuning is disabled: the kernel's own defaults, which
+# every supported shape can take, since tile_n divides the scale block and the
+# op's contract already makes N and K multiples of it.
+DEFAULT_TILE = {
+    "tile_m": 256,
+    "tile_n": 128,
+    "waves_m": 4,
+    "waves_n": 2,
+    "waves_per_eu": 0,
+}
+
+# Candidates swept by autotune. tile_k is absent: the scales change every 128
+# elements of K and a tile spanning more than one scale block would need a fold
+# per sub-block, so the kernel fixes it at the block size.
+_TILE_M = (32, 64, 128, 256)
+# Capped at the scale block, above which a tile would span several B scales.
+_TILE_N = (64, 128)
+# The wave grid is explicit rather than a wave count, because its shape is what
+# drives LDS read traffic: reads per unit work are waves_m / tile_m + waves_n /
+# tile_n, so the grid wants to be proportioned like the tile. Both four-wave and
+# eight-wave blocks are offered, in each proportion the tiles above can divide.
+_WAVE_GRIDS = ((1, 4), (2, 2), (4, 1), (2, 4), (4, 2), (8, 1))
+# Occupancy target, as a minimum waves-per-EU hint to the register allocator; 0
+# leaves the choice to the compiler.
+_WAVES_PER_EU = (0, 2)
+
+# Roughly half of these divide into whole MFMA tiles per wave and whole 16-byte
+# loads per lane, and fit LDS; the rest raise, which the autotuner reports and
+# skips. Enumerating the legal subset here instead would duplicate the kernel's
+# guards and drift from them.
+_TILES = tuple(
+    {
+        "tile_m": tm,
+        "tile_n": tn,
+        "waves_m": wm,
+        "waves_n": wn,
+        "waves_per_eu": wpe,
+    }
+    for tm in _TILE_M
+    for tn in _TILE_N
+    for (wm, wn) in _WAVE_GRIDS
+    for wpe in _WAVES_PER_EU
+)
+
+_PRUNE = prune_by_divisibility({"tile_n": "n"})
+_KEY = ["m_bucket", "n", "k"]
 
 
 def _matmul_gfx942(XQ, WQ, x_scale, w_scale, M, N, K):
@@ -66,22 +114,44 @@ def _matmul_gfx942(XQ, WQ, x_scale, w_scale, M, N, K):
     )
 
 
-def _matmul_gfx950(XQ, WQ, x_scale, w_scale, M, N, K):
-    """Serve the op from the kernel written for it.
+def _launch_gfx950(
+    XQ,
+    WQ,
+    x_scale,
+    w_scale,
+    out,
+    m_bucket,
+    n,
+    k,
+    *,
+    tile_m,
+    tile_n,
+    waves_m,
+    waves_n,
+    waves_per_eu=0,
+):
+    """Compile (cached) and launch the dedicated kernel for one config.
 
-    The tile and wave grid are left at the kernel's defaults until they are
-    swept: which one wins is a per-shape question, and a hand-written ladder
-    would only be a guess to unpick later.
+    ``m_bucket`` only feeds the autotune key: bucketing M keeps nearby token
+    counts on one tuned config. ``n``/``k`` are passed for the key and for tile
+    pruning, and are read back off the operands here.
     """
     from mslk.flydsl.jit import run_compiled
     from mslk.flydsl.kernels.gemm.fp8_groupwise_wide_gemm import (
         compile_groupwise_wide_gemm,
     )
 
-    launcher = compile_groupwise_wide_gemm(n=N, k=K, tile_k=_SCALE_BLOCK)
-    # The grid covers every row and column of the output, so nothing is left
-    # unwritten and the buffer does not have to start zeroed.
-    out = torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
+    launcher = compile_groupwise_wide_gemm(
+        n=n,
+        k=k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=_SCALE_BLOCK,
+        waves_m=waves_m,
+        waves_n=waves_n,
+        # 0 means the compiler picks.
+        waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
+    )
     # The kernel addresses the operands as flat byte buffers; FP8 is viewed as
     # int8 for the handoff, as the grouped path does.
     run_compiled(
@@ -91,12 +161,25 @@ def _matmul_gfx950(XQ, WQ, x_scale, w_scale, M, N, K):
         WQ.contiguous().view(torch.int8),
         x_scale.contiguous(),
         w_scale.contiguous(),
-        M,
-        N,
-        K,
+        XQ.shape[0],
+        n,
+        k,
         torch.cuda.current_stream(),
     )
     return out
+
+
+_tuned_gfx950 = tunable(
+    configs=_TILES, default=DEFAULT_TILE, key=_KEY, prune=_PRUNE
+)(_launch_gfx950)
+
+
+def _matmul_gfx950(XQ, WQ, x_scale, w_scale, M, N, K):
+    """Serve the op from the kernel written for it."""
+    # The grid covers every row and column of the output, so nothing is left
+    # unwritten and the buffer does not have to start zeroed.
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
+    return _tuned_gfx950(XQ, WQ, x_scale, w_scale, out, next_pow2(M), N, K)
 
 
 @functools.lru_cache(maxsize=1)
