@@ -87,9 +87,7 @@ if torch.version.hip is not None:
             mod = _flydsl_gemm_module("fp8_groupwise_gemm")
             if mod is not None:
                 return mod.matmul_f8f8bf16_groupwise
-            from .triton.fp8_groupwise_gemm import (
-                matmul_f8f8bf16_groupwise as _impl,
-            )
+            from .triton.fp8_groupwise_gemm import matmul_f8f8bf16_groupwise as _impl
 
             return _impl
 

@@ -170,9 +170,9 @@ def _launch_gfx950(
     return out
 
 
-_tuned_gfx950 = tunable(
-    configs=_TILES, default=DEFAULT_TILE, key=_KEY, prune=_PRUNE
-)(_launch_gfx950)
+_tuned_gfx950 = tunable(configs=_TILES, default=DEFAULT_TILE, key=_KEY, prune=_PRUNE)(
+    _launch_gfx950
+)
 
 
 def _matmul_gfx950(XQ, WQ, x_scale, w_scale, M, N, K):

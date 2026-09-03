@@ -48,17 +48,9 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
-from flydsl._mlir.dialects import math as math_dialect
-from flydsl._mlir.dialects import memref as memref_dialect
+from flydsl._mlir.dialects import llvm, math as math_dialect, memref as memref_dialect
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import (
-    arith,
-    buffer_ops,
-    gpu,
-    range_constexpr,
-    rocdl,
-)
+from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
@@ -190,9 +182,7 @@ def compile_groupwise_wide_gemm(
 
     gpu_arch = get_hip_arch()
     if not str(gpu_arch).startswith("gfx95"):
-        raise ValueError(
-            f"the wide f8f6f4 MFMA is gfx950-only; arch is {gpu_arch}"
-        )
+        raise ValueError(f"the wide f8f6f4 MFMA is gfx950-only; arch is {gpu_arch}")
 
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem_gw_wide")
     lds_a_elems = tile_m * tile_k
@@ -213,8 +203,7 @@ def compile_groupwise_wide_gemm(
     # much as the tile and the wave grid do.
     _wpe = f"_wpe{int(waves_per_eu)}" if waves_per_eu else ""
     module_name = (
-        f"gw_wide_n{n}_k{k}_t{tile_m}x{tile_n}x{tile_k}"
-        f"_w{waves_m}x{waves_n}{_wpe}"
+        f"gw_wide_n{n}_k{k}_t{tile_m}x{tile_n}x{tile_k}_w{waves_m}x{waves_n}{_wpe}"
     )
 
     # The AMDGPU default caps a workgroup at 256 threads; an eight-wave block
@@ -410,7 +399,9 @@ def compile_groupwise_wide_gemm(
                 ld = llvm.LoadOp(v4i32, ptr, alignment=16)
                 tag_alias(ld, _SCOPE_READS)
                 halves.append(Vector(ld.result))
-            return Vector(halves[0]).shuffle(Vector(halves[1]), list(range(8))).ir_value()
+            return (
+                Vector(halves[0]).shuffle(Vector(halves[1]), list(range(8))).ir_value()
+            )
 
         def mfma(a_op, b_op, c_in):
             # The scale operands are the neutral exponent, so the instruction's
@@ -418,9 +409,15 @@ def compile_groupwise_wide_gemm(
             # afterwards instead.
             return rocdl.mfma_scale_f32_32x32x64_f8f6f4(
                 v_acc_ty,
-                _raw(a_op), _raw(b_op), _raw(c_in),
-                0, 0, 0,
-                _raw(fx.Int32(NEUTRAL_E8M0)), 0, _raw(fx.Int32(NEUTRAL_E8M0)),
+                _raw(a_op),
+                _raw(b_op),
+                _raw(c_in),
+                0,
+                0,
+                0,
+                _raw(fx.Int32(NEUTRAL_E8M0)),
+                0,
+                _raw(fx.Int32(NEUTRAL_E8M0)),
             ).result
 
         zero_acc = Vector.from_elements(
@@ -513,7 +510,9 @@ def compile_groupwise_wide_gemm(
                     out.append(Vector.from_elements(vals, fx.Float32))
             return out
 
-        accs = [Vector(zero_acc, (ACC_REGS,), fx.Float32) for _ in range_constexpr(n_acc)]
+        accs = [
+            Vector(zero_acc, (ACC_REGS,), fx.Float32) for _ in range_constexpr(n_acc)
+        ]
 
         # One tile deep: tile kt is read out of LDS while tile kt+1 is in flight
         # towards the other slot. Both operands go straight from global memory to
