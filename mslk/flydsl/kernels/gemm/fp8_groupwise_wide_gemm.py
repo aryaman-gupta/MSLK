@@ -542,20 +542,38 @@ def compile_groupwise_wide_gemm(
         # outstanding loads, measures slower at every tile tried.
         dma_stage(fx.Index(0), fx.Index(0))
 
-        for _kt, _st in fx.range(0, num_k_tiles, 1, init=list(accs)):
-            _cur = split_state(_st)
-            _now = _kt % fx.Index(STAGES)
-            _next_slot = (_kt + fx.Index(1)) % fx.Index(STAGES)
+        # The loop stops one tile short and the last is peeled below, so that the
+        # transfer here is unconditional. Guarding it instead would put it in a
+        # block of its own, where it can no longer be interleaved with the MFMAs
+        # it is supposed to run underneath.
+        if num_k_tiles > 1:
+            for _kt, _st in fx.range(0, num_k_tiles - 1, 1, init=list(accs)):
+                _cur = split_state(_st)
+                _now = _kt % fx.Index(STAGES)
+                _next_slot = (_kt + fx.Index(1)) % fx.Index(STAGES)
 
-            rocdl.s_waitcnt(0)
-            gpu.barrier()
+                rocdl.s_waitcnt(0)
+                gpu.barrier()
 
-            dma_stage(_kt + fx.Index(1), _next_slot)
+                dma_stage(_kt + fx.Index(1), _next_slot)
 
-            _tiles = tile_product(a_buf(_now), b_buf(_now))
-            _res = yield fold(_cur, _tiles, load_scales(_kt))
+                _tiles = tile_product(a_buf(_now), b_buf(_now))
+                _res = yield fold(_cur, _tiles, load_scales(_kt))
 
-        accs = split_state(_res)
+            accs = split_state(_res)
+
+        # The peeled tile. Its operands are already in flight from the last
+        # iteration, and there is no successor to fetch, so this is the loop body
+        # without the transfer.
+        _last = num_k_tiles - 1
+        _last_slot = _last % STAGES
+        rocdl.s_waitcnt(0)
+        gpu.barrier()
+        accs = fold(
+            accs,
+            tile_product(a_buf(fx.Index(_last_slot)), b_buf(fx.Index(_last_slot))),
+            load_scales(fx.Index(_last)),
+        )
 
         # ---- epilogue --------------------------------------------------------
         # The transposed accumulator leaves a lane holding one output row and
