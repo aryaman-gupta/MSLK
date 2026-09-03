@@ -184,24 +184,33 @@ def _matmul_gfx950(XQ, WQ, x_scale, w_scale, M, N, K):
 
 
 @functools.lru_cache(maxsize=1)
-def _kernel() -> Callable[..., torch.Tensor]:
-    """Which kernel serves this op on the current GPU.
+def is_supported() -> bool:
+    """Whether this module can serve the op on the current GPU.
 
-    Named architectures rather than "gfx950 or else": FlyDSL reports itself
-    available on the RDNA parts too, which have no MFMA at all, and falling
-    through to a kernel built on one would fail somewhere deep inside it.
+    Both kernels below are built on MFMA, which the RDNA parts do not have --
+    and FlyDSL reports itself available on those, so having the backend says
+    nothing about whether this op can run. Callers pick an implementation with
+    this rather than with backend availability; ``mslk/gemm/__init__.py`` falls
+    back to Triton when it is False.
 
     Resolved once rather than per call: the architecture cannot change within a
     process, and reading it costs a device-property lookup that dwarfs a tensor
     attribute access.
     """
+    return is_gfx950() or is_gfx942()
+
+
+@functools.lru_cache(maxsize=1)
+def _kernel() -> Callable[..., torch.Tensor]:
+    """Which kernel serves this op on the current GPU."""
     if is_gfx950():
         return _matmul_gfx950
     if is_gfx942():
         return _matmul_gfx942
     raise RuntimeError(
         "mslk::f8f8bf16_groupwise on ROCm is implemented for gfx942 and gfx950; "
-        "this GPU is neither."
+        "this GPU is neither. Reach it through torch.ops.mslk, which falls back "
+        "to Triton elsewhere."
     )
 
 
