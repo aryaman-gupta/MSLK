@@ -301,6 +301,7 @@ def compile_fp8_grouped_gemm(
         scale_block_n=scale_block_n,
         k_padding=k_padding,
         in_dtype=in_dtype,
+        scaling=scaling,
     )
     # Check the LDS budget before tracing: the compiler treats an overflow as a
     # hard error that kills the process, which an autotuner cannot skip. Capacity
@@ -332,6 +333,7 @@ def compile_fp8_grouped_gemm(
     scale_k = _c.scale_k
     scale_n = _c.scale_n
     sb_per_tile = _c.sb_per_tile
+    ku_per_sb = _c.ku_per_sb
     k_unroll = _c.k_unroll
     kpack_bytes = _c.kpack_bytes
     tile_k_bytes = _c.tile_k_bytes
@@ -762,10 +764,6 @@ def compile_fp8_grouped_gemm(
 
             mfma_res_ty = T.f32x4
 
-            # Operand packs per scale block. The K loop steps 64 bytes at a
-            # time, so a scale block's K extent has to be measured the same way;
-            # sb_per_tile * ku_per_sb is then k_unroll for any dtype.
-            ku_per_sb = scale_block_k * elem_bytes // 64
             rocdl.sched_barrier(0)
 
             if const_expr(b_preshuffled):

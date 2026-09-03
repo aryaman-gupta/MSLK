@@ -129,6 +129,7 @@ CompileConstants = namedtuple(
         "scale_k",
         "scale_n",
         "sb_per_tile",
+        "ku_per_sb",
         "k_unroll",
         "kpack_bytes",
         "kpack_elems",
@@ -163,9 +164,12 @@ def validate_params(
     the grouped GEMM kernels.
 
     scale_block_k splits a K tile into the sub-blocks the MFMA schedule steps
-    through, so tile_k must cover a whole number of them under any scaling
-    scheme -- a tile_k below scale_block_k yields zero sub-blocks and a compute
-    loop that never runs.
+    through to fold the scales, so where there are scales tile_k must cover a
+    whole number of them -- a tile_k below scale_block_k yields zero sub-blocks
+    and a compute loop that never runs. Unscaled operands have nothing to fold
+    and treat the whole tile as one sub-block, which frees tile_k from the
+    scale-block granularity: that is what lets bf16 pick a tile_k small enough
+    to keep more than one workgroup resident per CU.
 
     scale_block_n only matters to block scaling, where a tile must not straddle
     a scale block. Rowwise scaling carries one scale per row of A and per column
@@ -208,7 +212,7 @@ def validate_params(
             )
     elif n % tile_n != 0:
         raise ValueError(f"n ({n}) must be divisible by tile_n ({tile_n})")
-    if tile_k % scale_block_k != 0:
+    if scaling != SCALING_NONE and tile_k % scale_block_k != 0:
         raise ValueError(
             f"tile_k ({tile_k}) must be divisible by scale_block_k ({scale_block_k})"
         )
@@ -323,6 +327,7 @@ def compute_compile_constants(
     scale_block_n,
     k_padding=False,
     in_dtype="fp8",
+    scaling=SCALING_ROW,
 ):
     """Compute the compile-time scalar constants shared by both kernels.
 
@@ -343,11 +348,24 @@ def compute_compile_constants(
     num_k_tiles = -(-k // tile_k) if k_padding else k // tile_k
     scale_k = k // scale_block_k
     scale_n = n // scale_block_n
-    sb_per_tile = tile_k // scale_block_k  # scale blocks per K-tile
 
     tile_k_bytes = tile_k * elem_bytes
     # 64-byte micro-steps, one per pair of K32 MFMA issues.
     k_unroll = tile_k_bytes // 64
+    # The sub-block is the K extent over which one set of scales is constant,
+    # and so the unit the compute loop steps through to fold them in. Unscaled
+    # operands have nothing to fold, so the whole tile is one sub-block and
+    # tile_k stops being tied to the scale-block granularity.
+    sb_per_tile = 1 if scaling == SCALING_NONE else tile_k // scale_block_k
+    if sb_per_tile <= 0 or k_unroll % sb_per_tile != 0:
+        raise ValueError(
+            f"tile_k ({tile_k}) yields {sb_per_tile} scale sub-block(s) per tile "
+            f"and {k_unroll} 64-byte steps, which do not divide"
+        )
+    # Derived rather than stated, so the two cannot drift: the sub-blocks
+    # partition the tile's 64-byte steps exactly.
+    ku_per_sb = k_unroll // sb_per_tile
+
     # A lane reads its operand a 16-byte pack at a time whatever the dtype; how
     # many elements that covers is what changes.
     kpack_bytes = 16
@@ -366,6 +384,23 @@ def compute_compile_constants(
     chunk_i32_b = a_load_bytes // 4  # same 16-byte dwordx4 load
     num_b_loads = bytes_per_thread_b // a_load_bytes
 
+    # A tile too small to give every thread a whole 16-byte load rounds its load
+    # count to zero, which stages nothing and leaves the compute loop reading an
+    # LDS buffer that was never written. Reject it rather than emit a kernel
+    # that runs fast and returns garbage.
+    if num_a_loads <= 0 or bytes_per_thread_a % a_load_bytes != 0:
+        raise ValueError(
+            f"tile_m ({tile_m}) x tile_k ({tile_k}) at {elem_bytes} B/elem gives "
+            f"{bytes_per_thread_a} A bytes per thread, which is not a positive "
+            f"multiple of the {a_load_bytes}-byte load width"
+        )
+    if num_b_loads <= 0 or bytes_per_thread_b % a_load_bytes != 0:
+        raise ValueError(
+            f"tile_n ({tile_n}) x tile_k ({tile_k}) at {elem_bytes} B/elem gives "
+            f"{bytes_per_thread_b} B bytes per thread, which is not a positive "
+            f"multiple of the {a_load_bytes}-byte load width"
+        )
+
     return CompileConstants(
         total_threads=total_threads,
         elem_bytes=elem_bytes,
@@ -373,6 +408,7 @@ def compute_compile_constants(
         scale_k=scale_k,
         scale_n=scale_n,
         sb_per_tile=sb_per_tile,
+        ku_per_sb=ku_per_sb,
         k_unroll=k_unroll,
         kpack_bytes=kpack_bytes,
         kpack_elems=kpack_elems,

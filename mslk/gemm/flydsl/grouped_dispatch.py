@@ -25,20 +25,29 @@ from mslk.flydsl.autotune import next_pow2, prune_by_divisibility, tunable
 from mslk.flydsl.jit import run_compiled
 from mslk.utils.device import supports_float8_fnuz
 
-# Scale-block granularity for the block-scaling scheme. It also sets the K-loop
-# sub-block size under either scheme, so tile_k must be a multiple of it.
+# Scale-block granularity for the block-scaling scheme. Where there are scales it
+# also sets the K-loop sub-block size, so tile_k must then be a multiple of it.
 SCALE_BLOCK = 128
 
 # Default tile when autotuning is disabled. Valid for any supported shape
 # (tile_n = tile_k = 128 divide every supported N/K, including a small N=128).
 DEFAULT_TILE = {"tile_m": 128, "tile_n": 128, "tile_k": 128, "waves_per_eu": 2}
 
-# Candidate tiles swept by autotune. tile_k is a multiple of the K-loop sub-block
-# size under either scheme. Rowwise scaling additionally allows tile_n below the
+# Candidate tiles swept by autotune. Rowwise scaling allows tile_n below the
 # scale block, which block scaling cannot express, so the two schemes sweep
 # different sets. Tiles that overflow LDS are rejected at compile time.
 _TILE_M = (64, 128, 256)
 _TILE_K = (128, 256)
+
+# Unscaled operands sweep wider on both axes. tile_k is not pinned to the scale
+# block, and a two-byte dtype needs the room: its tile spans twice the LDS of the
+# one-byte tile of the same shape, so at tile_k=128 a 128x128 tile already holds
+# a whole CU's worth and runs one workgroup at a time. Shrinking tile_k buys that
+# back most cheaply, since LDS grows as (tile_m + tile_n) * tile_k while the MFMA
+# work grows as tile_m * tile_n * tile_k. tile_m=32 is the other end of the same
+# trade, for the decode shapes where a group holds only a few rows.
+_UNSCALED_TILE_M = (32, 64, 128, 256)
+_UNSCALED_TILE_K = (64, 128, 256)
 
 # Occupancy target, as a minimum waves-per-EU hint to the register allocator; 0
 # leaves the choice to the compiler. Preshuffled B is held in registers across a
@@ -49,18 +58,23 @@ _TILE_K = (128, 256)
 _WAVES_PER_EU = (0, 2)
 
 
-def _tiles(tile_ns):
+def _tiles(tile_ns, tile_ms=_TILE_M, tile_ks=_TILE_K):
     return tuple(
         {"tile_m": tm, "tile_n": tn, "tile_k": tk, "waves_per_eu": wpe}
-        for tm in _TILE_M
+        for tm in tile_ms
         for tn in tile_ns
-        for tk in _TILE_K
+        for tk in tile_ks
         for wpe in _WAVES_PER_EU
     )
 
 
 BLOCKSCALE_TILES = _tiles((128, 256))
 ROWWISE_TILES = _tiles((64, 128, 256))
+# tile_n stops at 64: the CShuffle epilogue lays 32 lanes across N at 2 columns
+# each, so a narrower tile has no store to make.
+UNSCALED_TILES = _tiles(
+    (64, 128, 256), tile_ms=_UNSCALED_TILE_M, tile_ks=_UNSCALED_TILE_K
+)
 
 # A tile that overruns N or K still compiles, as the tail-masked variant, but it
 # wastes part of its work on padding and is not going to win, so prune on both
@@ -236,13 +250,16 @@ def launch(
     return out
 
 
-# The two scaling schemes sweep different tiles, so each gets its own tuned entry
-# point; the cache key carries the scheme as well, since the kernels differ.
+# Each scaling scheme sweeps a different tile set, so each gets its own tuned
+# entry point; the cache key carries the scheme as well, since the kernels differ.
 _launch_blockscale = tunable(
     configs=BLOCKSCALE_TILES, default=DEFAULT_TILE, key=_KEY, prune=_PRUNE
 )(launch)
 _launch_rowwise = tunable(
     configs=ROWWISE_TILES, default=DEFAULT_TILE, key=_KEY, prune=_PRUNE
+)(launch)
+_launch_unscaled = tunable(
+    configs=UNSCALED_TILES, default=DEFAULT_TILE, key=_KEY, prune=_PRUNE
 )(launch)
 
 
@@ -298,9 +315,14 @@ def dispatch(
     # The groups divide K, so one group contracts over a fraction of it.
     k_key = K // G if layout == "k_offsets" else K
 
-    # Block scaling is the only scheme that constrains tile_n to the scale
-    # block; rowwise and unscaled operands both sweep the wider set.
-    tuned_launch = _launch_blockscale if scaling == "block" else _launch_rowwise
+    # Each scheme is free of the constraints the one before it carries: block
+    # scaling pins tile_n and tile_k to the scale block, rowwise pins only
+    # tile_k, and unscaled operands pin neither.
+    tuned_launch = {
+        "block": _launch_blockscale,
+        "row": _launch_rowwise,
+        "none": _launch_unscaled,
+    }[scaling]
     return tuned_launch(
         XQ,
         WQ,
