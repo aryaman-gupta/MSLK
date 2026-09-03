@@ -6,12 +6,13 @@
 
 # pyre-unsafe
 
-"""Shared host dispatch for the FlyDSL grouped FP8 GEMM ops.
+"""Shared host dispatch for the FlyDSL grouped GEMM ops.
 
-One kernel serves every combination of B layout (plain or MFMA-preshuffled) and
-scaling scheme (block or rowwise); this module holds the host-side work common to
-all of them -- operand marshalling, grid extent, and tile selection -- so each op
-module only supplies its own contract checks.
+One kernel serves every combination of input dtype (fp8 or bf16), B layout
+(plain or MFMA-preshuffled) and scaling scheme (block, rowwise or none); this
+module holds the host-side work common to all of them -- operand marshalling,
+grid extent, and tile selection -- so each op module only supplies its own
+contract checks.
 
 Tile selection is delegated to mslk.flydsl.autotune, which tunes only when
 MSLK_AUTOTUNE_ENABLE is set and otherwise uses a fixed default.
@@ -70,7 +71,7 @@ _PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
 # roll_k is deliberately absent: it is fixed policy rather than something that
 # varies per call, and a tuning space containing a fully unrolled candidate would
 # have to compile one per tile config, at a cost that grows with K.
-_KEY = ["m_bucket", "n", "k", "b_preshuffled", "scaling", "layout"]
+_KEY = ["m_bucket", "n", "k", "b_preshuffled", "scaling", "layout", "in_dtype"]
 
 
 def assert_fp8_operands(XQ: torch.Tensor, WQ: torch.Tensor) -> None:
@@ -103,6 +104,18 @@ def unused_group_meta(device: torch.device) -> torch.Tensor:
     return torch.zeros((1,), dtype=torch.int32, device=device)
 
 
+@functools.lru_cache(maxsize=8)
+def unused_scales(device: torch.device) -> torch.Tensor:
+    """Stand-in for the scale operands where the operands carry no scales.
+
+    Unscaled inputs have none to pass and the kernel emits no load against
+    them, but the launcher's argument list is fixed at compile time. Cached for
+    the same reasons as `unused_group_meta`: no per-call allocation, and a
+    stable address for CUDA-graph capture.
+    """
+    return torch.zeros((1,), dtype=torch.float32, device=device)
+
+
 def _group_and_n(WQ, group_meta, layout):
     """Group count and total N, which the weights only carry for some layouts.
 
@@ -131,6 +144,7 @@ def launch(
     scaling,
     layout="sizes",
     roll_k=True,
+    in_dtype="fp8",
     *,
     tile_m,
     tile_n,
@@ -146,6 +160,9 @@ def launch(
     ``m_bucket`` only feeds the autotune key: bucketing total_M keeps nearby token
     counts on one tuned config. ``n``/``k`` are likewise passed for the key and
     for tile pruning, and are read back off the operands here.
+
+    ``in_dtype`` names the operand element type the kernel is compiled for.
+    ``x_scale``/``w_scale`` may be None where it carries no scales.
     """
     from mslk.flydsl.kernels.gemm.fp8_grouped_gemm import compile_fp8_grouped_gemm
 
@@ -181,6 +198,7 @@ def launch(
         scale_block_k=SCALE_BLOCK,
         scale_block_n=SCALE_BLOCK,
         out_dtype="bf16",
+        in_dtype=in_dtype,
         b_preshuffled=b_preshuffled,
         scaling=scaling,
         layout=layout,
@@ -197,15 +215,16 @@ def launch(
     )
     # Operands keep their natural shape: argument marshalling packs each memref
     # extent as int32, which a flattened view overflows at 2**31 elements. The
-    # kernel addresses them as flat byte buffers regardless. FP8 is viewed as
-    # int8 for the handoff.
+    # kernel addresses them as flat byte buffers regardless, so every input
+    # dtype is viewed as int8 for the handoff.
+    _no_scales = unused_scales(XQ.device)
     run_compiled(
         launcher,
         out,
         XQ.contiguous().view(torch.int8),
         WQ.contiguous().view(torch.int8),
-        x_scale.contiguous(),
-        w_scale.contiguous(),
+        _no_scales if x_scale is None else x_scale.contiguous(),
+        _no_scales if w_scale is None else w_scale.contiguous(),
         m_sizes.contiguous(),
         total_M,
         N,
@@ -238,6 +257,7 @@ def dispatch(
     scaling,
     layout="sizes",
     roll_k=True,
+    in_dtype="fp8",
     out=None,
 ):
     """Allocate the output if needed and run the grouped GEMM with a selected tile.
@@ -278,6 +298,8 @@ def dispatch(
     # The groups divide K, so one group contracts over a fraction of it.
     k_key = K // G if layout == "k_offsets" else K
 
+    # Block scaling is the only scheme that constrains tile_n to the scale
+    # block; rowwise and unscaled operands both sweep the wider set.
     tuned_launch = _launch_blockscale if scaling == "block" else _launch_rowwise
     return tuned_launch(
         XQ,
@@ -293,4 +315,5 @@ def dispatch(
         scaling,
         layout,
         roll_k,
+        in_dtype,
     )

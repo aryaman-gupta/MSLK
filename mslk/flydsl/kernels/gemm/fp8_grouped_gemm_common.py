@@ -7,10 +7,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Shared building blocks for the grouped FP8 GEMM kernel.
+"""Shared building blocks for the grouped GEMM kernel.
 
 Used by fp8_grouped_gemm.py: parameter validation, compile-time scalar
 constants, and the helper closures the kernel body is built from.
+
+Quantities that describe memory are held in bytes and quantities that describe
+the contraction in elements, so that the helpers serve any input dtype without
+disentangling the two per call. The LDS arena is byte-typed for the same
+reason: the XOR16 swizzle and the pack loads are then dtype-agnostic, and only
+the MFMA selection in `make_compute_tile` has to know the element size.
 
 Block scaling indexes scale_b as [num_groups, scale_k, scale_n] (per-group,
 per-K-block, per-N-block) and scale_a as [scale_k, M] (transposed, per-token
@@ -59,7 +65,15 @@ N_STORE_ELEMS = 8
 
 
 def make_k_tail_mask(
-    *, k_padding, num_k_tiles, k, tile_k, k_in, always=False, k_bound=None
+    *,
+    k_padding,
+    num_k_tiles,
+    k,
+    tile_k,
+    k_in,
+    elem_bytes=1,
+    always=False,
+    k_bound=None,
 ):
     """Build the per-load K-range predicate used by the A and B tile loaders.
 
@@ -93,10 +107,14 @@ def make_k_tail_mask(
         # Loads are 16-byte aligned and K is a multiple of that width, so a chunk
         # is either wholly inside K or wholly outside it.
         chunk_start_div4 = base_k_div4 + col_local_i32
+        # Both sides are dword positions in the row's byte stream, so a bound
+        # counted in K elements has to be widened by the element size first.
+        # The two coincide for the one-byte dtypes.
+        bound_bytes = _bound if elem_bytes == 1 else _bound * fx.Index(elem_bytes)
         return arith.cmpi(
             arith.CmpIPredicate.ult,
             arith.index_cast(T.i32, chunk_start_div4),
-            arith.index_cast(T.i32, _bound // fx.Index(4)),
+            arith.index_cast(T.i32, bound_bytes // fx.Index(4)),
         )
 
     return mask
@@ -137,6 +155,7 @@ def validate_params(
     scale_block_n,
     out_dtype,
     scaling=SCALING_ROW,
+    in_dtype="fp8",
     k_padding=False,
     n_padding=False,
 ):
@@ -155,6 +174,19 @@ def validate_params(
     """
     if scaling not in SCALINGS:
         raise ValueError(f"scaling must be one of {SCALINGS}, got {scaling!r}")
+    if in_dtype not in ELEM_BYTES:
+        raise ValueError(
+            f"in_dtype must be one of {tuple(ELEM_BYTES)}, got {in_dtype!r}"
+        )
+    # The dtype decides whether there are scales at all: a quantised operand is
+    # meaningless without them, and a bf16 one carries its own exponent and has
+    # none to apply. Pairing them the other way would silently read scale
+    # buffers the caller never filled, or drop the ones it did.
+    if (in_dtype == "fp8") != (scaling != SCALING_NONE):
+        raise ValueError(
+            f"in_dtype {in_dtype!r} does not admit scaling {scaling!r}: the "
+            "quantised dtypes require a scaling scheme and bf16 requires 'none'"
+        )
     blockscale = scaling == SCALING_BLOCK
     if k_padding:
         # The tail K tile is masked off per 16-byte load, so K only has to land on
@@ -361,8 +393,9 @@ def setup_lds_allocation(*, allocator, tile_m, tile_k, tile_n, elem_bytes):
 
     The ping-pong A buffers and the FP16/BF16 epilogue output share the same
     LDS arena (alias), so we reserve the max of the two. Returns
-    `(lds_alloc_offset, lds_tile_elems)` where `lds_tile_elems` is the
-    A-element stride between the ping and pong halves.
+    `(lds_alloc_offset, lds_tile_bytes)` where `lds_tile_bytes` is the byte
+    stride between the ping and pong halves. The kernel addresses its A/B
+    arena as raw bytes whatever the input dtype, so this is a byte offset.
     """
     lds_a_bytes = tile_m * tile_k * elem_bytes
     lds_pingpong_bytes = 2 * lds_a_bytes
@@ -370,8 +403,7 @@ def setup_lds_allocation(*, allocator, tile_m, tile_k, tile_n, elem_bytes):
     lds_total_bytes = max(lds_pingpong_bytes, lds_out_bytes)
     lds_alloc_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_alloc_offset + lds_total_bytes
-    lds_tile_elems = tile_m * tile_k  # element offset between ping and pong
-    return lds_alloc_offset, lds_tile_elems
+    return lds_alloc_offset, lds_a_bytes
 
 
 def setup_lds_allocation_plain(
@@ -385,24 +417,25 @@ def setup_lds_allocation_plain(
     LDS coexist during the K-loop. The epilogue output aliases the whole arena
     (offset 0) since it runs after the final K-loop barrier.
 
-    Returns `(lds_alloc_offset, lds_tile_elems, lds_b_offset_elems)` where:
+    Returns `(lds_alloc_offset, lds_tile_bytes, lds_b_offset_bytes)` where:
       - `lds_alloc_offset` is the byte base of the arena (A ping half at 0),
-      - `lds_tile_elems` is the A ping<->pong element stride (= tile_m*tile_k),
-      - `lds_b_offset_elems` is the element offset (from arena base) to the B
+      - `lds_tile_bytes` is the A ping<->pong byte stride,
+      - `lds_b_offset_bytes` is the byte offset (from arena base) to the B
         buffer, i.e. just past the A ping-pong region.
+
+    All three are byte quantities because the kernel addresses this arena as
+    raw bytes whatever the input dtype.
     """
-    lds_a_elems = tile_m * tile_k
-    lds_a_pingpong_elems = 2 * lds_a_elems
+    lds_a_bytes = tile_m * tile_k * elem_bytes
+    lds_a_pingpong_bytes = 2 * lds_a_bytes
     b_buffers = 2 if b_pingpong else 1
-    lds_b_elems = b_buffers * tile_n * tile_k
-    kloop_elems = lds_a_pingpong_elems + lds_b_elems  # FP8: 1 byte/elem
+    lds_b_bytes = b_buffers * tile_n * tile_k * elem_bytes
+    kloop_bytes = lds_a_pingpong_bytes + lds_b_bytes
     lds_out_bytes = tile_m * tile_n * 2
-    lds_total_bytes = max(kloop_elems * elem_bytes, lds_out_bytes)
+    lds_total_bytes = max(kloop_bytes, lds_out_bytes)
     lds_alloc_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_alloc_offset + lds_total_bytes
-    lds_tile_elems = lds_a_elems
-    lds_b_offset_elems = lds_a_pingpong_elems
-    return lds_alloc_offset, lds_tile_elems, lds_b_offset_elems
+    return lds_alloc_offset, lds_a_bytes, lds_a_pingpong_bytes
 
 
 GroupResolution = namedtuple(
@@ -672,6 +705,11 @@ def make_a_tile_loaders(
     shifts every load to the start of this group's K slice, for the layouts
     where the groups divide K rather than an output axis; the row stride stays
     the full K, since the slice is a column block of a wider matrix.
+
+    `elem_bytes` is the size of an A element. Addresses here are dword
+    positions in the row's byte stream, so it is what turns the row's K extent
+    into a stride; it coincides with the element count only for the one-byte
+    dtypes.
     """
     _k_tail_mask = k_tail_mask or (lambda *_: None)
     layout_a_tile_div4 = fx.make_layout(
@@ -679,7 +717,8 @@ def make_a_tile_loaders(
     )
     c_chunk_a = fx.Index(chunk_i32_a)
     tx_i32_base = tx * c_chunk_a
-    _k_div4_factor = k_in // fx.Index(4)
+    _k_bytes = k_in if elem_bytes == 1 else k_in * fx.Index(elem_bytes)
+    _k_div4_factor = _k_bytes // fx.Index(4)
     if m_in is not None and group_idx is not None:
         a_tile_offset_div4 = group_idx * m_in * _k_div4_factor  # 3D A Offset
     else:
@@ -743,7 +782,10 @@ def make_a_tile_loaders(
                 k_blocks16=k_blocks16,
                 lds_base=lds_base,
                 vec_part_i32x4=a_parts[i],
-                elem_bytes=elem_bytes,
+                # The store's elem_bytes is the element size of the LDS memref,
+                # not of A: this arena is byte-typed and `layout_lds` is in
+                # bytes, so the swizzled column needs no further conversion.
+                elem_bytes=1,
             )
 
     return (
@@ -793,6 +835,9 @@ def make_b_tile_loaders(
     (dwordx4) loads via `tile_chunk_coord_i32`; LDS store uses the same XOR16
     swizzle as A. Returns `(prefetch_b_tile, store_b_tile_to_lds, b_row_local,
     b_col_local_i32, k_blocks16_b)`.
+
+    `elem_bytes` is the size of a B element, which is what turns the row's K
+    extent into the dword stride the addresses here are counted in.
     """
     _k_tail_mask = k_tail_mask or (lambda *_: None)
     layout_b_tile_div4 = fx.make_layout(
@@ -800,7 +845,8 @@ def make_b_tile_loaders(
     )
     c_chunk_b = fx.Index(chunk_i32_b)
     tx_i32_base = tx * c_chunk_b
-    _k_div4_factor = k_in // fx.Index(4)
+    _k_bytes = k_in if elem_bytes == 1 else k_in * fx.Index(elem_bytes)
+    _k_div4_factor = _k_bytes // fx.Index(4)
     # B is [G, N, K]: leading offset selects this tile's group and N-block base.
     b_tile_offset_div4 = (
         b_group_off if b_group_off is not None else group_idx * n_in * _k_div4_factor
@@ -871,7 +917,8 @@ def make_b_tile_loaders(
                 k_blocks16=k_blocks16_b,
                 lds_base=lds_base,
                 vec_part_i32x4=b_parts[i],
-                elem_bytes=elem_bytes,
+                # As in the A store: byte-typed LDS, byte-based layout.
+                elem_bytes=1,
             )
 
     return (
@@ -884,11 +931,16 @@ def make_b_tile_loaders(
 
 
 def make_lds_loader(*, lds_a, layout_lds, k_blocks16):
-    """Build the LDS-side A K64 pack loader.
+    """Build the LDS-side A pack loader.
 
     Returns `lds_load_packs_k64(curr_row_a_lds, col_base_bytes, lds_base)`
     which loads 16B from LDS with the XOR16 swizzle and returns the two
     i64 halves.
+
+    The load is of 16 raw bytes -- `T.f8` names the LDS arena's byte element
+    type, not the dtype of the data -- so this is the same for every input
+    dtype. What differs downstream is how much of a pack one MFMA consumes:
+    see `make_compute_tile`.
     """
 
     def lds_load_packs_k64(curr_row_a_lds, col_base_bytes, lds_base):
@@ -1047,6 +1099,10 @@ def make_hot_loop_scheduler(
     Emits the dsrd / mfma / vmem_rd / dswr group barriers in the order
     matching the MoE stage-2 pattern. Returns a zero-arg closure to be
     invoked once per K-tile body inside the ping-pong loop.
+
+    The MFMA group size assumes the two issues per operand pack that the
+    one-byte dtypes make; a dtype whose MFMA consumes a whole pack would need
+    this counted differently.
     """
 
     def hot_loop_scheduler():
@@ -1160,6 +1216,7 @@ def make_compute_tile(
     group_m_start=None,
     group_m_size=None,
     scaling=SCALING_ROW,
+    in_dtype="fp8",
 ):
     """Build the per-K-tile compute closure.
 
@@ -1185,6 +1242,53 @@ def make_compute_tile(
     # constant along K and apply once in the epilogue, and unscaled operands
     # have nothing to apply, so both leave this loop accumulating straight.
     blockscale = scaling == SCALING_BLOCK
+    if in_dtype not in ELEM_BYTES:
+        raise ValueError(
+            f"in_dtype must be one of {tuple(ELEM_BYTES)}, got {in_dtype!r}"
+        )
+
+    # The wide 16x16x128 MFMA reads its operands as f8f6f4, so it serves the
+    # one-byte dtypes only; the two-byte ones take the narrow path below even
+    # on gfx950, where their own K32 instruction lives.
+    use_wide_mfma = _is_gfx950 and in_dtype == "fp8"
+
+    # How much of one 16-byte LDS pack a single MFMA issue consumes. A 16x16xK
+    # MFMA spreads 16*K element slots over a 64-lane wave, so a lane holds K/4
+    # elements, i.e. K*elem_bytes/4 bytes. fp8's 16x16x32 wants 8 of the 16 and
+    # so issues twice per pack; bf16's gfx950 16x16x32 wants all 16 and issues
+    # once. Either way a pack is one unit of K, which is what lets the two share
+    # the loop below.
+    mfma_res_ty_narrow = T.f32x4
+    if in_dtype == "bf16":
+        if _is_gfx950:
+
+            def mfma_pack(acc_in, a0, a1, b0, b1):
+                av = Vector.from_elements([a0, a1], fx.Int64).bitcast(fx.BFloat16)
+                bv = Vector.from_elements([b0, b1], fx.Int64).bitcast(fx.BFloat16)
+                return rocdl.mfma_f32_16x16x32_bf16(
+                    mfma_res_ty_narrow, [av, bv, acc_in, 0, 0, 0]
+                )
+
+        else:
+
+            def mfma_pack(acc_in, a0, a1, b0, b1):
+                # gfx942 has no K32 bf16 MFMA, so a pack is two K16 issues.
+                mid = rocdl.mfma_f32_16x16x16bf16_1k(
+                    mfma_res_ty_narrow, [a0, b0, acc_in, 0, 0, 0]
+                )
+                return rocdl.mfma_f32_16x16x16bf16_1k(
+                    mfma_res_ty_narrow, [a1, b1, mid, 0, 0, 0]
+                )
+
+    else:
+
+        def mfma_pack(acc_in, a0, a1, b0, b1):
+            mid = rocdl.mfma_f32_16x16x32_fp8_fp8(
+                mfma_res_ty_narrow, [a0, b0, acc_in, 0, 0, 0]
+            )
+            return rocdl.mfma_f32_16x16x32_fp8_fp8(
+                mfma_res_ty_narrow, [a1, b1, mid, 0, 0, 0]
+            )
 
     def compute_tile(
         accs_in, k_tile_idx_py, lds_base, b_tile_in, scales_pf, *, a0_prefetch=None
@@ -1280,7 +1384,7 @@ def make_compute_tile(
                                 sb_e8m0_list[ni],
                             ],
                         )
-            elif _is_gfx950:
+            elif use_wide_mfma:
                 # gfx950: use the wide 16x16x128 MFMA with a neutral E8M0 scale
                 # (0x7F7F7F7F = no-op hardware scaling), which avoids the
                 # 4x-narrower 16x16x32 MFMA of the path below.
@@ -1375,17 +1479,13 @@ def make_compute_tile(
 
                         for ni in range_constexpr(num_acc_n):
                             acc_idx = mi * num_acc_n + ni
-                            mfma_fn = rocdl.mfma_f32_16x16x32_fp8_fp8
 
                             if blockscale:
                                 # This block's partial sum starts from zero so it
                                 # can be scaled on its own before joining the
                                 # running accumulator.
-                                mfma_mid = mfma_fn(
-                                    T.f32x4, [a0, b_packs0[ni], acc_init, 0, 0, 0]
-                                )
-                                mfma_result = mfma_fn(
-                                    T.f32x4, [a1, b_packs1[ni], mfma_mid, 0, 0, 0]
+                                mfma_result = mfma_pack(
+                                    acc_init, a0, a1, b_packs0[ni], b_packs1[ni]
                                 )
 
                                 s_a_v4 = s_a_vecs[mi]
@@ -1399,12 +1499,12 @@ def make_compute_tile(
                             else:
                                 # Nothing to scale per block, so chain the MFMAs
                                 # straight onto the running accumulator.
-                                mfma_mid = mfma_fn(
-                                    T.f32x4,
-                                    [a0, b_packs0[ni], current_accs[acc_idx], 0, 0, 0],
-                                )
-                                current_accs[acc_idx] = mfma_fn(
-                                    T.f32x4, [a1, b_packs1[ni], mfma_mid, 0, 0, 0]
+                                current_accs[acc_idx] = mfma_pack(
+                                    current_accs[acc_idx],
+                                    a0,
+                                    a1,
+                                    b_packs0[ni],
+                                    b_packs1[ni],
                                 )
 
         return current_accs
