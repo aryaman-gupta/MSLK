@@ -84,6 +84,8 @@ from mslk.flydsl.kernels.gemm.fp8_grouped_gemm_common import (
     resolve_group_cols,
     resolve_group_k,
     resolve_group_rows,
+    SCALING_BLOCK,
+    SCALING_ROW,
     setup_lds_allocation,
     setup_lds_allocation_plain,
     validate_lds_budget_plain,
@@ -113,7 +115,7 @@ def compile_fp8_grouped_gemm(
     out_dtype: str = "bf16",
     waves_per_eu: int | None = None,
     b_preshuffled: bool = True,
-    blockscale: bool = False,
+    scaling: str = SCALING_ROW,
     layout: str = "sizes",
     k_padding: bool = False,
     n_padding: bool = False,
@@ -146,15 +148,18 @@ def compile_fp8_grouped_gemm(
             like A. The two paths share the entire kernel body (tile-map group
             dispatch, scaling, wide-MFMA, CShuffle epilogue); only the B load
             stage and its LDS allocation differ.
-        blockscale: Selects the scaling scheme, which sets the expected layout of
+        scaling: Selects the scaling scheme, which sets the expected layout of
             scale_a / scale_b and where the scales are applied.
-            False (default) is rowwise: scale_a is [M_total] and scale_b is
-            [num_groups, N], one factor per row of A and per column of B, applied
-            once in the epilogue. Tiles are then free of scale-block alignment,
-            so tile_n may be smaller than scale_block_n.
-            True is block scaling: scale_a is per-group [M_g, scale_k] blocks and
-            scale_b is [num_groups, scale_k, scale_n], applied per scale block
-            inside the K loop, which requires the tile to align to the blocks.
+            "row" (default): scale_a is [M_total] and scale_b is [num_groups, N],
+            one factor per row of A and per column of B, applied once in the
+            epilogue. Tiles are then free of scale-block alignment, so tile_n may
+            be smaller than scale_block_n.
+            "block": scale_a is per-group [M_g, scale_k] blocks and scale_b is
+            [num_groups, scale_k, scale_n], applied per scale block inside the K
+            loop, which requires the tile to align to the blocks.
+            "none": the operands carry no scales at all, as bf16 does. Nothing is
+            folded in the K loop and nothing is applied in the epilogue, and the
+            scale arguments are ignored.
         layout: How the kernel learns which rows belong to which group. The
             encodings differ only in that resolution step; the loaders, the K
             loop and the epilogue are shared.
@@ -207,7 +212,7 @@ def compile_fp8_grouped_gemm(
     # and produces a whole output of its own.
     k_grouped = layout == "k_offsets"
     if k_grouped:
-        if blockscale or b_preshuffled:
+        if scaling != SCALING_ROW or b_preshuffled:
             raise ValueError(
                 "layout 'k_offsets' supports only rowwise scaling with plain B: "
                 "a scale block cannot straddle a group's K slice, and the "
@@ -220,7 +225,7 @@ def compile_fp8_grouped_gemm(
         roll_k = True
         k_padding = True
     if n_grouped:
-        if blockscale or b_preshuffled:
+        if scaling != SCALING_ROW or b_preshuffled:
             raise ValueError(
                 "layout 'n_offsets' supports only rowwise scaling with plain B: "
                 "ragged N would need per-group scale blocks, and the preshuffled "
@@ -248,7 +253,7 @@ def compile_fp8_grouped_gemm(
         k=k,
         tile_n=tile_n,
         tile_k=tile_k,
-        blockscale=blockscale,
+        scaling=scaling,
         k_padding=k_padding,
         n_padding=n_padding,
         scale_block_k=scale_block_k,
@@ -318,7 +323,7 @@ def compile_fp8_grouped_gemm(
 
     # Module name for caching
     _variant = "pingpong" if b_preshuffled else "plain"
-    _scaling = "blockscale" if blockscale else "rowwise"
+    _scaling = scaling if scaling != SCALING_ROW else "rowwise"
     _kpad = "_kpad" if k_padding else ""
     _roll = "_rollk" if roll_k else ""
     _wpe = f"_wpe{int(waves_per_eu)}" if waves_per_eu else ""
@@ -433,7 +438,7 @@ def compile_fp8_grouped_gemm(
         # pre-packed on host); gfx942 SW path consumes f32.
         scale_byte_size = 1 if _use_hw_scale else 4
 
-        if const_expr(blockscale):
+        if const_expr(scaling == SCALING_BLOCK):
             # scale_a: per-group [M_g, scale_k] blocks, scale_k values per row.
             sa_nbytes = fx.Index(scale_k) * m_in * fx.Index(scale_byte_size)
             # scale_b: [num_groups, scale_k, scale_n]
@@ -756,7 +761,7 @@ def compile_fp8_grouped_gemm(
                 acc_init=acc_init,
                 group_m_start=fx.Index(group_m_start_i32),
                 group_m_size=fx.Index(group_m_size_i32),
-                blockscale=blockscale,
+                scaling=scaling,
             )
 
             if const_expr(b_preshuffled):
@@ -915,7 +920,7 @@ def compile_fp8_grouped_gemm(
             else:
                 accs = run_kloop(accs)
 
-            if const_expr(not blockscale):
+            if const_expr(scaling == SCALING_ROW):
                 # Rowwise scales are constant along K, so the whole reduction is
                 # scaled here in one pass rather than per K tile.
                 accs = make_rowwise_scaler(

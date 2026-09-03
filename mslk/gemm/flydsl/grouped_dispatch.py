@@ -70,7 +70,7 @@ _PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
 # roll_k is deliberately absent: it is fixed policy rather than something that
 # varies per call, and a tuning space containing a fully unrolled candidate would
 # have to compile one per tile config, at a cost that grows with K.
-_KEY = ["m_bucket", "n", "k", "b_preshuffled", "blockscale", "layout"]
+_KEY = ["m_bucket", "n", "k", "b_preshuffled", "scaling", "layout"]
 
 
 def assert_fp8_operands(XQ: torch.Tensor, WQ: torch.Tensor) -> None:
@@ -128,7 +128,7 @@ def launch(
     n,
     k,
     b_preshuffled,
-    blockscale,
+    scaling,
     layout="sizes",
     roll_k=True,
     *,
@@ -182,7 +182,7 @@ def launch(
         scale_block_n=SCALE_BLOCK,
         out_dtype="bf16",
         b_preshuffled=b_preshuffled,
-        blockscale=blockscale,
+        scaling=scaling,
         layout=layout,
         roll_k=roll_k,
         # 0 means the compiler picks.
@@ -235,7 +235,7 @@ def dispatch(
     M_sizes,
     *,
     b_preshuffled,
-    blockscale,
+    scaling,
     layout="sizes",
     roll_k=True,
     out=None,
@@ -278,7 +278,7 @@ def dispatch(
     # The groups divide K, so one group contracts over a fraction of it.
     k_key = K // G if layout == "k_offsets" else K
 
-    tuned_launch = _launch_blockscale if blockscale else _launch_rowwise
+    tuned_launch = _launch_blockscale if scaling == "block" else _launch_rowwise
     return tuned_launch(
         XQ,
         WQ,
@@ -290,7 +290,7 @@ def dispatch(
         n_key,
         k_key,
         b_preshuffled,
-        blockscale,
+        scaling,
         layout,
         roll_k,
     )

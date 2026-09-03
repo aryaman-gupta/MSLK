@@ -35,6 +35,16 @@ from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import (
     tile_chunk_coord_i32,
 )
 
+# How the operands are scaled, which decides where the scales are applied and
+# whether they exist at all.
+#   block  one scale per (128, 128) block of B and per (1, 128) of A, folded in
+#          per scale block inside the K loop, so the tile must align to them.
+#   row    one scale per row of A and per column of B, constant along K, so they
+#          factor out of the reduction and apply once in the epilogue.
+#   none   unscaled operands, as bf16 has; the scale machinery compiles away.
+SCALING_BLOCK, SCALING_ROW, SCALING_NONE = "block", "row", "none"
+SCALINGS = (SCALING_BLOCK, SCALING_ROW, SCALING_NONE)
+
 # FP8 elements covered by one 16-byte vectorised load. With k_padding the tail K
 # tile is masked a whole load at a time, so this is the finest K granularity the
 # kernel can end on.
@@ -126,7 +136,7 @@ def validate_params(
     scale_block_k,
     scale_block_n,
     out_dtype,
-    blockscale=False,
+    scaling=SCALING_ROW,
     k_padding=False,
     n_padding=False,
 ):
@@ -134,15 +144,18 @@ def validate_params(
     the grouped GEMM kernels.
 
     scale_block_k splits a K tile into the sub-blocks the MFMA schedule steps
-    through, so tile_k must cover a whole number of them under either scaling
+    through, so tile_k must cover a whole number of them under any scaling
     scheme -- a tile_k below scale_block_k yields zero sub-blocks and a compute
     loop that never runs.
 
     scale_block_n only matters to block scaling, where a tile must not straddle
     a scale block. Rowwise scaling carries one scale per row of A and per column
     of B and applies it in the epilogue, so tile_n is free of that alignment and
-    may be smaller than scale_block_n.
+    may be smaller than scale_block_n; unscaled operands are freer still.
     """
+    if scaling not in SCALINGS:
+        raise ValueError(f"scaling must be one of {SCALINGS}, got {scaling!r}")
+    blockscale = scaling == SCALING_BLOCK
     if k_padding:
         # The tail K tile is masked off per 16-byte load, so K only has to land on
         # a load boundary rather than a whole tile.
@@ -1146,7 +1159,7 @@ def make_compute_tile(
     sa_group_off=None,
     group_m_start=None,
     group_m_size=None,
-    blockscale=False,
+    scaling=SCALING_ROW,
 ):
     """Build the per-K-tile compute closure.
 
@@ -1168,6 +1181,10 @@ def make_compute_tile(
     the K loop accumulates unscaled, leaving a single scaling in the epilogue
     (see `make_rowwise_scaler`).
     """
+    # Only block scaling folds anything inside the K loop. Rowwise scales are
+    # constant along K and apply once in the epilogue, and unscaled operands
+    # have nothing to apply, so both leave this loop accumulating straight.
+    blockscale = scaling == SCALING_BLOCK
 
     def compute_tile(
         accs_in, k_tile_idx_py, lds_base, b_tile_in, scales_pf, *, a0_prefetch=None
