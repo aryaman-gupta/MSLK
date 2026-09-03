@@ -103,6 +103,7 @@ CompileConstants = namedtuple(
         "sb_per_tile",
         "k_unroll",
         "kpack_bytes",
+        "kpack_elems",
         "tile_k_bytes",
         "tile_k_dwords",
         "bytes_a_per_tile",
@@ -262,25 +263,50 @@ def out_mlir_for(out_dtype):
     return lambda: T.bf16 if out_dtype == "bf16" else T.f16
 
 
+#: Bytes an element of each supported input dtype occupies.
+ELEM_BYTES = {"fp8": 1, "bf16": 2}
+
+
 def compute_compile_constants(
-    *, n, k, tile_m, tile_n, tile_k, scale_block_k, scale_block_n, k_padding=False
+    *,
+    n,
+    k,
+    tile_m,
+    tile_n,
+    tile_k,
+    scale_block_k,
+    scale_block_n,
+    k_padding=False,
+    in_dtype="fp8",
 ):
     """Compute the compile-time scalar constants shared by both kernels.
 
     Returns a `CompileConstants` namedtuple. Pure-Python — no MLIR ops emitted.
+
+    Quantities that describe memory stay in bytes and quantities that describe
+    the contraction stay in elements, so that the two do not have to be
+    disentangled per dtype. They coincide only for the one-byte dtypes.
     """
+    if in_dtype not in ELEM_BYTES:
+        raise ValueError(
+            f"in_dtype must be one of {tuple(ELEM_BYTES)}, got {in_dtype!r}"
+        )
     total_threads = 256
-    elem_bytes = 1  # FP8
+    elem_bytes = ELEM_BYTES[in_dtype]
     # With k_padding the last tile is only partly covered by K; it still runs, with
     # its out-of-range loads masked to zero, which contribute nothing to the sum.
     num_k_tiles = -(-k // tile_k) if k_padding else k // tile_k
     scale_k = k // scale_block_k
     scale_n = n // scale_block_n
     sb_per_tile = tile_k // scale_block_k  # scale blocks per K-tile
-    k_unroll = tile_k // 64  # K64-byte micro-steps (for K32 MFMA pairs)
-    kpack_bytes = 16  # 16-byte packs for FP8
 
     tile_k_bytes = tile_k * elem_bytes
+    # 64-byte micro-steps, one per pair of K32 MFMA issues.
+    k_unroll = tile_k_bytes // 64
+    # A lane reads its operand a 16-byte pack at a time whatever the dtype; how
+    # many elements that covers is what changes.
+    kpack_bytes = 16
+    kpack_elems = kpack_bytes // elem_bytes
     tile_k_dwords = tile_k_bytes // 4
     bytes_a_per_tile = tile_m * tile_k * elem_bytes
     bytes_per_thread_a = bytes_a_per_tile // total_threads
@@ -304,6 +330,7 @@ def compute_compile_constants(
         sb_per_tile=sb_per_tile,
         k_unroll=k_unroll,
         kpack_bytes=kpack_bytes,
+        kpack_elems=kpack_elems,
         tile_k_bytes=tile_k_bytes,
         tile_k_dwords=tile_k_dwords,
         bytes_a_per_tile=bytes_a_per_tile,
