@@ -176,6 +176,48 @@ def _group_and_n(WQ, group_meta, layout):
     return WQ.shape[0], WQ.shape[1]
 
 
+#: What one AMD buffer descriptor can address. Its num_records is a 32-bit
+#: field, and so is the voffset a buffer_load adds, so nothing beyond this is
+#: reachable through one of them.
+_BUFFER_LIMIT_BYTES = 1 << 32
+
+
+def _assert_addressable(total_M, N, K, G, elem_bytes, layout):
+    """Reject a shape whose operands a buffer descriptor could not reach.
+
+    The kernel bases A, B and D at the block's own group so that each
+    descriptor spans one group rather than the whole operand, which is what
+    makes a many-expert weight stack addressable at all. A single group can
+    still exceed the limit, and the hardware would answer that by reading zero
+    and dropping stores rather than by faulting, so it is worth refusing here
+    instead of returning a wrong result.
+
+    Only the extents the host knows are checked. Where the groups are packed
+    along M their row counts live on the device, and bounding them here by
+    total_M would reject the many-group shapes the re-basing exists to support,
+    so those go unchecked; the slab layouts divide M evenly and are known.
+    """
+    checks = [("B (one group's weights)", N * K * elem_bytes)]
+    if layout in ("padded", "batched", "n_offsets"):
+        # Every group owns the same fixed slab, so its height is host-known.
+        slab_m = total_M // G
+        checks += [
+            ("A (one group's rows)", slab_m * K * elem_bytes),
+            ("D (one group's output)", slab_m * N * 2),
+        ]
+    elif layout == "k_offsets":
+        # Each group produces a whole [M, N] output of its own.
+        checks.append(("D (one group's output)", total_M * N * 2))
+    for what, nbytes in checks:
+        if nbytes >= _BUFFER_LIMIT_BYTES:
+            raise ValueError(
+                f"{what} is {nbytes} bytes, which a buffer descriptor cannot "
+                f"address (limit {_BUFFER_LIMIT_BYTES}). Shape: total_M={total_M} "
+                f"N={N} K={K} G={G} at {elem_bytes} B/element, layout {layout!r}. "
+                "Split the call along the axis that is too long."
+            )
+
+
 def launch(
     XQ,
     WQ,
@@ -216,6 +258,7 @@ def launch(
 
     total_M, K = XQ.shape
     G, N = _group_and_n(WQ, m_sizes, layout)
+    _assert_addressable(total_M, N, K, G, XQ.element_size(), layout)
     if b_preshuffled and (K % tile_k != 0 or N % tile_n != 0):
         raise ValueError(
             f"n ({N}) and k ({K}) must be divisible by tile_n ({tile_n}) and "
