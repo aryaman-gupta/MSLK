@@ -498,6 +498,32 @@ def compile_fp8_grouped_gemm(
         # row has to be widened by the element size.
         k_bytes_in = k_in if elem_bytes == 1 else k_in * fx.Index(elem_bytes)
 
+        def rebased_resource(arg, num_records_bytes, byte_offset=None):
+            """Buffer descriptor over one slab of an operand, based at that slab.
+
+            A descriptor addresses at most 4 GiB: both its num_records and the
+            voffset a buffer_load adds are 32-bit. A stack of per-group weights
+            passes that at a realistic expert count -- 128 experts of 16384x5120
+            BF16 is 21.5 GB -- and the hardware answers an out-of-range load with
+            zero, so the kernel would return a wrong result at full speed rather
+            than fail.
+
+            Folding the group into the base address instead keeps the descriptor
+            over one group, which no realistic shape exceeds, and does the
+            arithmetic that selects the group in 64 bits. `preshuffle_gemm.py`
+            bases its batched operands the same way.
+
+            The offset goes to `base_byte_offset`, which is applied to the
+            descriptor's base pointer, so the group term never passes through a
+            32-bit quantity on its way in.
+            """
+            return buffer_ops.create_buffer_resource(
+                arg,
+                max_size=False,
+                num_records_bytes=num_records_bytes,
+                base_byte_offset=byte_offset,
+            )
+
         # Where the groups divide K, A is [M, total_K] -- one set of rows shared
         # by every group -- while the output and scale_a hold a slab per group.
         a_nbytes = m_in * k_bytes_in
@@ -505,17 +531,9 @@ def compile_fp8_grouped_gemm(
             arg_a, max_size=False, num_records_bytes=a_nbytes
         )
 
-        # B is one [total_N, K] matrix when the groups divide N, and a stack of
-        # num_groups [N, K] ones otherwise.
-        if const_expr(n_grouped or k_grouped):
-            # One matrix the groups divide, by row under n_offsets and by column
-            # under k_offsets.
-            b_nbytes = n_in * k_bytes_in
-        else:
-            b_nbytes = num_groups_in * n_in * k_bytes_in
-        b_rsrc = buffer_ops.create_buffer_resource(
-            arg_b, max_size=False, num_records_bytes=b_nbytes
-        )
+        # B's descriptor is built further down, once the group is resolved: it is
+        # based at this block's group rather than at the whole stack.
+        b_nbytes = n_in * k_bytes_in
 
         # The output is [M, total_N] when the groups divide N: m_in counts the
         # rows of every group's slab, but they share the output's rows.
@@ -625,24 +643,32 @@ def compile_fp8_grouped_gemm(
             # Where the owning group's columns stop; the bound for both the B
             # row tail and the epilogue's column mask.
             n_bound = fx.Index(_col.col_limit)
-            b_group_off = fx.Index(0)
             # scale_b is one flat [total_N] here, so the group is already in by_n.
             sb_group_off = fx.Index(0)
         elif const_expr(k_grouped):
-            # B is a single [N, total_K] the groups slice by column, so it has no
-            # per-group row base -- the slice is expressed as a K offset instead.
+            # B is a single [N, total_K] the groups slice by column, so the slice
+            # is expressed as a K offset rather than a row base.
             # scale_b is still [G, N], one set of column scales per group.
             n_bound = None
-            b_group_off = fx.Index(0)
             sb_group_off = None
         else:
             n_bound = None
-            b_group_off = None
             sb_group_off = None
 
         # Early exit for surplus/no-op tiles.
         if is_valid:
             group_idx = fx.Index(group_id_i32)
+
+            # B is one [total_N, K] matrix when the groups divide N or K, and a
+            # stack of num_groups [N, K] ones otherwise. Only the stack has a
+            # group axis to fold into the base; the single matrix is already one
+            # slab, which every block reads whole.
+            if const_expr(n_grouped or k_grouped):
+                b_rsrc = rebased_resource(arg_b, b_nbytes)
+            else:
+                b_rsrc = rebased_resource(
+                    arg_b, b_nbytes, byte_offset=group_idx * b_nbytes
+                )
 
             # Global row base of this tile and the exclusive row end of its group
             # (the group end masks the partial-tile tail in the epilogue store).
@@ -779,7 +805,6 @@ def compile_fp8_grouped_gemm(
                     lds_b=lds_b,
                     layout_lds_b=layout_lds_b,
                     by_n=by_n,
-                    group_idx=group_idx,
                     tx=tx,
                     tile_n=tile_n,
                     tile_k=tile_k,
@@ -793,7 +818,6 @@ def compile_fp8_grouped_gemm(
                     k_in=k_in,
                     k_tail_mask=k_tail_mask,
                     n_padding=n_padding,
-                    b_group_off=b_group_off,
                     n_bound=n_bound,
                     k_base_div4=k_base_div4,
                 )
