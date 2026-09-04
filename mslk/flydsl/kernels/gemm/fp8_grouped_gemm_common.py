@@ -1821,6 +1821,7 @@ def make_epilogue_writers(
     out_mlir,
     e_vec,
     c_n,
+    d_group_off=None,
     d_row_base=None,
     n_padding=False,
     n_bound=None,
@@ -1829,14 +1830,14 @@ def make_epilogue_writers(
 
     Returns `(write_row_to_lds, store_pair)` to be passed to `mfma_epilog`.
 
-    `d_row_base` is the first output row of the slab `d_rsrc` is based at. The
-    epilogue works in global rows, so subtracting it gives the row within that
-    descriptor. It exists because a descriptor reaches only 4 GiB and a whole
-    output can exceed that, which the store would meet not as a fault but as a
-    dropped write; see `rebased_resource` in the grouped kernel. None means the
-    descriptor spans the whole output and the row needs no adjusting, which is
-    what a caller whose output is one matrix wants; no subtraction is then
-    emitted.
+    The output row reaches the store one of two ways, and a caller supplies at
+    most one of them. `d_group_off` adds the group's slab to a global row, which
+    is what a descriptor spanning the whole output wants. `d_row_base` instead
+    subtracts the first row of the slab the descriptor is based at, which is
+    what a descriptor covering one group wants -- needed once the whole output
+    passes the 4 GiB a descriptor reaches, since past that the store is dropped
+    rather than faulting. Both None is the plain case: one matrix, global rows,
+    and no adjustment emitted.
 
     `c_n` is the output's leading dimension, and normally also bounds the column
     mask, since a group's columns run to the end of its row. Where groups sit
@@ -1866,8 +1867,12 @@ def make_epilogue_writers(
             v1.store(lds_out, [lds_idx], alignment=2)
 
     def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-        row_in_slab = row if d_row_base is None else row - d_row_base
-        idx_out = row_in_slab * c_n + col_g0
+        if d_group_off is not None:
+            idx_out = d_group_off + row * c_n + col_g0
+        elif d_row_base is not None:
+            idx_out = (row - d_row_base) * c_n + col_g0
+        else:
+            idx_out = row * c_n + col_g0
         byte_off = idx_out * 2
         col_mask = None
         if n_padding:

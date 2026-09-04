@@ -182,32 +182,44 @@ def _group_and_n(WQ, group_meta, layout):
 _BUFFER_LIMIT_BYTES = 1 << 32
 
 
-def _assert_addressable(total_M, N, K, G, elem_bytes, layout):
-    """Reject a shape whose operands a buffer descriptor could not reach.
+def _addressing_plan(total_M, N, K, G, elem_bytes, layout):
+    """Decide whether A and D need per-group basing, and reject the unreachable.
 
-    The kernel bases A, B and D at the block's own group so that each
-    descriptor spans one group rather than the whole operand, which is what
-    makes a many-expert weight stack addressable at all. A single group can
-    still exceed the limit, and the hardware would answer that by reading zero
-    and dropping stores rather than by faulting, so it is worth refusing here
-    instead of returning a wrong result.
+    B is always based at its group: a weight stack passes the limit at any
+    realistic expert count, and its group comes from the block index, so the
+    descriptor costs nothing to build. A and D are different -- theirs depends
+    on the group resolution, so basing them delays the first loads behind it and
+    measures about a quarter of the runtime on the FP8 groupwise shapes. They
+    keep addressing rows globally while their whole extent still fits one
+    descriptor, and only switch when it does not.
 
-    Only the extents the host knows are checked. Where the groups are packed
-    along M their row counts live on the device, and bounding them here by
-    total_M would reject the many-group shapes the re-basing exists to support,
-    so those go unchecked; the slab layouts divide M evenly and are known.
+    Returns ``group_based_rows``. Raises where even one group would not fit,
+    which no basing can rescue.
+
+    Only extents the host knows are checked. Where the groups are packed along M
+    their row counts live on the device, so a per-group extent cannot be
+    computed here; bounding it by total_M would reject the many-group shapes the
+    basing exists to support. Those get the basing whenever the whole operand is
+    too big, and are left to the kernel from there.
     """
+    d_rows = total_M // G if layout == "n_offsets" else total_M
+    d_whole = d_rows * N * 2 * (G if layout == "k_offsets" else 1)
+    a_whole = total_M * K * elem_bytes
+    group_based_rows = a_whole >= _BUFFER_LIMIT_BYTES or d_whole >= _BUFFER_LIMIT_BYTES
+
+    # B is per-group whatever happens, so its per-group extent always has to fit.
     checks = [("B (one group's weights)", N * K * elem_bytes)]
-    if layout in ("padded", "batched", "n_offsets"):
-        # Every group owns the same fixed slab, so its height is host-known.
-        slab_m = total_M // G
-        checks += [
-            ("A (one group's rows)", slab_m * K * elem_bytes),
-            ("D (one group's output)", slab_m * N * 2),
-        ]
-    elif layout == "k_offsets":
-        # Each group produces a whole [M, N] output of its own.
-        checks.append(("D (one group's output)", total_M * N * 2))
+    if group_based_rows:
+        if layout in ("padded", "batched", "n_offsets"):
+            # Every group owns the same fixed slab, so its height is host-known.
+            slab_m = total_M // G
+            checks += [
+                ("A (one group's rows)", slab_m * K * elem_bytes),
+                ("D (one group's output)", slab_m * N * 2),
+            ]
+        elif layout == "k_offsets":
+            # Each group produces a whole [M, N] output of its own.
+            checks.append(("D (one group's output)", total_M * N * 2))
     for what, nbytes in checks:
         if nbytes >= _BUFFER_LIMIT_BYTES:
             raise ValueError(
@@ -216,6 +228,7 @@ def _assert_addressable(total_M, N, K, G, elem_bytes, layout):
                 f"N={N} K={K} G={G} at {elem_bytes} B/element, layout {layout!r}. "
                 "Split the call along the axis that is too long."
             )
+    return group_based_rows
 
 
 def launch(
@@ -258,7 +271,7 @@ def launch(
 
     total_M, K = XQ.shape
     G, N = _group_and_n(WQ, m_sizes, layout)
-    _assert_addressable(total_M, N, K, G, XQ.element_size(), layout)
+    group_based_rows = _addressing_plan(total_M, N, K, G, XQ.element_size(), layout)
     if b_preshuffled and (K % tile_k != 0 or N % tile_n != 0):
         raise ValueError(
             f"n ({N}) and k ({K}) must be divisible by tile_n ({tile_n}) and "
@@ -305,6 +318,7 @@ def launch(
         # A group's column end is a runtime value when the groups divide N, so
         # the tail mask is always needed there.
         n_padding=(N % tile_n != 0) or layout == "n_offsets",
+        group_based_rows=group_based_rows,
     )
     # Operands keep their natural shape: argument marshalling packs each memref
     # extent as int32, which a flattened view overflows at 2**31 elements. The

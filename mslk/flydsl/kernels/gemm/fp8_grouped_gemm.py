@@ -137,6 +137,7 @@ def compile_fp8_grouped_gemm(
     layout: str = "sizes",
     k_padding: bool = False,
     n_padding: bool = False,
+    group_based_rows: bool = False,
     roll_k: bool = False,
 ):
     """Compile grouped FP8 GEMM kernel and return the JIT launcher.
@@ -170,6 +171,18 @@ def compile_fp8_grouped_gemm(
         n_padding: Emit the per-store column predicate so N need only reach an
             8-column store boundary rather than a whole tile. Forced on where
             the groups divide N, for the same reason.
+        group_based_rows: Address A and D from the owning group's first row
+            rather than from the operand's, and bound each descriptor by that
+            group rather than by the whole operand. Needed once A or D passes
+            the 4 GiB a buffer descriptor reaches, past which the hardware reads
+            zero and drops stores rather than faulting -- a wrong answer at full
+            speed. It costs about a quarter of the runtime on the FP8 groupwise
+            shapes, measured at a pinned config and not explained by anything in
+            the emitted code -- the hot loop is the same size, the registers and
+            LDS are unchanged, and where the descriptor is built makes no
+            difference -- so the host sets it only for the shapes that have no
+            alternative. B is based at its group either way, which measures
+            free.
         b_preshuffled: When True (default) B is expected pre-swizzled into the
             MFMA layout and loaded HBM->registers (no B LDS). When False, B is
             plain row-major [num_groups, N, K] and is staged HBM->LDS->registers
@@ -398,10 +411,13 @@ def compile_fp8_grouped_gemm(
     # The wave grid changes the emitted kernel, so it has to reach the name or a
     # second grid over the same tile would collide in the JIT cache.
     _wg = f"_w{waves_m}x{waves_n}" if (waves_m, waves_n) != (1, 4) else ""
+    # The row basing changes the emitted kernel, so it has to reach the name or
+    # the two forms would collide in the JIT cache.
+    _gbr = "_gbr" if group_based_rows else ""
     module_name = (
         f"grouped_gemm_{in_dtype}_{_scaling}_{layout}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_wpe}{_wg}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_wpe}{_wg}{_gbr}"
     ).replace("-", "_")
 
     # The AMDGPU default caps a workgroup at 256 threads, so a grid of more than
@@ -689,30 +705,44 @@ def compile_fp8_grouped_gemm(
                 k_base_div4 = None
                 k_bound = None
 
-            # A and D are addressed from this group's first row rather than from
-            # the operand's, for the reason B is: a whole operand can exceed what
-            # one descriptor reaches. A packed A at 300k rows of K=8192 in BF16
-            # is 4.6 GB with only four groups, so this is not the many-expert
-            # case alone. Rows inside the loaders and the epilogue are then
-            # group-local, and the group's own extent bounds each descriptor.
-            a_group_rows = fx.Index(group_m_size_i32)
-            a_row_base = fx.Index(group_m_start_i32)
-            a_rsrc = rebased_resource(
-                arg_a,
-                a_group_rows * k_bytes_in,
-                byte_offset=a_row_base * k_bytes_in,
-            )
-            # Where the groups divide N the output rows are already slab-local,
-            # so the group is in the column and there is no row base to take.
-            d_row_base = fx.Index(0) if const_expr(n_grouped) else a_row_base
-            d_base_bytes = d_row_base * d_row_bytes
-            if d_group_off is not None:
-                # The groups divide K, so each owns a whole [M, N] output.
-                d_base_bytes = d_base_bytes + d_group_off * fx.Index(2)
-            d_group_rows = d_rows if const_expr(n_grouped) else a_group_rows
-            d_rsrc = rebased_resource(
-                arg_d, d_group_rows * d_row_bytes, byte_offset=d_base_bytes
-            )
+            if const_expr(group_based_rows):
+                # A and D are addressed from this group's first row rather than
+                # from the operand's, for the reason B always is: a whole operand
+                # can exceed what one descriptor reaches. A packed A at 300k rows
+                # of K=8192 in BF16 is 4.6 GB with only four groups, so this is
+                # not the many-expert case alone. Rows inside the loader and the
+                # epilogue are then group-local, and the group's own extent
+                # bounds each descriptor. This form is the slower one; see
+                # `group_based_rows`.
+                a_group_rows = fx.Index(group_m_size_i32)
+                a_row_base = fx.Index(group_m_start_i32)
+                a_rsrc = rebased_resource(
+                    arg_a,
+                    a_group_rows * k_bytes_in,
+                    byte_offset=a_row_base * k_bytes_in,
+                )
+                # Where the groups divide N the output rows are already
+                # slab-local, so the group is in the column and there is no row
+                # base to take.
+                d_row_base = fx.Index(0) if const_expr(n_grouped) else a_row_base
+                d_base_bytes = d_row_base * d_row_bytes
+                if d_group_off is not None:
+                    # The groups divide K, so each owns a whole [M, N] output.
+                    d_base_bytes = d_base_bytes + d_group_off * fx.Index(2)
+                    # Folded into the base, so the store must not add it again.
+                    d_group_off = None
+                d_group_rows = d_rows if const_expr(n_grouped) else a_group_rows
+                d_rsrc = rebased_resource(
+                    arg_d, d_group_rows * d_row_bytes, byte_offset=d_base_bytes
+                )
+                a_loader_row_base = a_row_base
+            else:
+                # One descriptor spans each whole operand, so the rows stay
+                # global and nothing is subtracted.
+                a_rsrc = rebased_resource(arg_a, m_in * k_bytes_in)
+                d_rsrc = rebased_resource(arg_d, d_rows * d_row_bytes)
+                d_row_base = None
+                a_loader_row_base = None
 
             _t = compute_mfma_tiling(
                 tile_m=tile_m, tile_n=tile_n, waves_m=waves_m, waves_n=waves_n
@@ -769,8 +799,9 @@ def compile_fp8_grouped_gemm(
                 a_rsrc=a_rsrc,
                 lds_a=lds_a,
                 layout_lds=layout_lds,
-                # Group-local: a_rsrc is based at this group's first row.
-                bx_m=bx_m - a_row_base,
+                # Group-local where a_rsrc is based at the group's first row;
+                # the plain global row otherwise.
+                bx_m=(bx_m if a_loader_row_base is None else bx_m - a_loader_row_base),
                 tx=tx,
                 tile_m=tile_m,
                 tile_k=tile_k,
@@ -1105,6 +1136,7 @@ def compile_fp8_grouped_gemm(
                 c_n=c_n,
                 n_padding=n_padding,
                 n_bound=n_bound,
+                d_group_off=d_group_off,
                 d_row_base=d_row_base,
             )
 
