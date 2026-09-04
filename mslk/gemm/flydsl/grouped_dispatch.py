@@ -29,9 +29,19 @@ from mslk.utils.device import supports_float8_fnuz
 # also sets the K-loop sub-block size, so tile_k must then be a multiple of it.
 SCALE_BLOCK = 128
 
-# Default tile when autotuning is disabled. Valid for any supported shape
+# Default config when autotuning is disabled. Valid for any supported shape
 # (tile_n = tile_k = 128 divide every supported N/K, including a small N=128).
-DEFAULT_TILE = {"tile_m": 128, "tile_n": 128, "tile_k": 128, "waves_per_eu": 2}
+# The wave grid stays at the historical 1x4 rather than the 2x2 this square tile
+# would favour: changing it moves every untuned call, which is a decision to
+# take on measurement rather than on the shape of the tile alone.
+DEFAULT_TILE = {
+    "tile_m": 128,
+    "tile_n": 128,
+    "tile_k": 128,
+    "waves_m": 1,
+    "waves_n": 4,
+    "waves_per_eu": 2,
+}
 
 # Candidate tiles swept by autotune. Rowwise scaling allows tile_n below the
 # scale block, which block scaling cannot express, so the two schemes sweep
@@ -57,14 +67,36 @@ _UNSCALED_TILE_K = (64, 128, 256)
 # needs 128, which no configuration of this kernel comes close to.
 _WAVES_PER_EU = (0, 2)
 
+# How the block's four waves divide the tile, as (waves_m, waves_n). Each wave
+# reads its whole slab of both operands out of LDS, so reads per unit work go as
+# waves_m / tile_m + waves_n / tile_n, smallest when the grid is proportioned
+# like the tile: 1x4 suits a tile four times wider than tall, 2x2 a square one,
+# 4x1 a tall one. All three are four waves, so they cost the same in threads,
+# LDS and registers and differ only in shape. Grids past four waves are a
+# different trade -- more waves per tile against a smaller register budget each
+# -- and are left out until that is measured on its own.
+_WAVE_GRIDS = ((1, 4), (2, 2), (4, 1))
 
-def _tiles(tile_ns, tile_ms=_TILE_M, tile_ks=_TILE_K):
+
+def _tiles(tile_ns, tile_ms=_TILE_M, tile_ks=_TILE_K, wave_grids=_WAVE_GRIDS):
+    # The wave grid has to cut the tile into whole 16x16 MFMA tiles, the same
+    # rule the kernel factory enforces. Applying it here keeps the tuning space
+    # free of configs that would only be built and thrown away.
     return tuple(
-        {"tile_m": tm, "tile_n": tn, "tile_k": tk, "waves_per_eu": wpe}
+        {
+            "tile_m": tm,
+            "tile_n": tn,
+            "tile_k": tk,
+            "waves_m": wm,
+            "waves_n": wn,
+            "waves_per_eu": wpe,
+        }
         for tm in tile_ms
         for tn in tile_ns
         for tk in tile_ks
+        for wm, wn in wave_grids
         for wpe in _WAVES_PER_EU
+        if tm % (wm * 16) == 0 and tn % (wn * 16) == 0
     )
 
 

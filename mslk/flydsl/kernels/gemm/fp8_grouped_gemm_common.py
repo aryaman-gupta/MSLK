@@ -1372,7 +1372,9 @@ def make_compute_tile(
                 for mi in range_constexpr(m_repeat):
                     s_a_row = []
                     for ii in range_constexpr(4):
-                        row_in_tile = _mfma_row_off(mi, m_wave_base) + row_off_base + fx.Index(ii)
+                        row_in_tile = (
+                            _mfma_row_off(mi, m_wave_base) + row_off_base + fx.Index(ii)
+                        )
                         row_global = bx_m + row_in_tile
                         sa_idx = sa_base + row_global
                         s_a_val = buffer_ops.buffer_load(
@@ -1607,7 +1609,9 @@ def make_rowwise_scaler(
         for mi in range_constexpr(m_repeat):
             s_a_row = []
             for ii in range_constexpr(4):
-                row_global = bx_m + _mfma_row_off(mi, m_wave_base) + row_off_base + fx.Index(ii)
+                row_global = (
+                    bx_m + _mfma_row_off(mi, m_wave_base) + row_off_base + fx.Index(ii)
+                )
                 s_a_row.append(
                     buffer_ops.buffer_load(
                         sa_rsrc, row_global, vec_width=1, dtype=T.f32
