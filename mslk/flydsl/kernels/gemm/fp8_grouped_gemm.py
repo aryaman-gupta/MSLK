@@ -524,15 +524,10 @@ def compile_fp8_grouped_gemm(
                 base_byte_offset=byte_offset,
             )
 
-        # Where the groups divide K, A is [M, total_K] -- one set of rows shared
-        # by every group -- while the output and scale_a hold a slab per group.
-        a_nbytes = m_in * k_bytes_in
-        a_rsrc = buffer_ops.create_buffer_resource(
-            arg_a, max_size=False, num_records_bytes=a_nbytes
-        )
-
-        # B's descriptor is built further down, once the group is resolved: it is
-        # based at this block's group rather than at the whole stack.
+        # A's, B's and D's descriptors are all built further down, once the group
+        # is resolved: each is based at this block's group rather than at the
+        # whole operand, so that none of them has to address more than one
+        # group's worth. See `rebased_resource`.
         b_nbytes = n_in * k_bytes_in
 
         # The output is [M, total_N] when the groups divide N: m_in counts the
@@ -543,10 +538,7 @@ def compile_fp8_grouped_gemm(
             d_rows = num_groups_in * m_in
         else:
             d_rows = m_in
-        d_nbytes = d_rows * n_in * fx.Index(2)  # bf16/f16 = 2 bytes
-        d_rsrc = buffer_ops.create_buffer_resource(
-            arg_d, max_size=False, num_records_bytes=d_nbytes
-        )
+        d_row_bytes = n_in * fx.Index(2)  # bf16/f16 = 2 bytes
 
         # Scale buffers — gfx950 HW E8M0 path consumes int8 (one byte/scale,
         # pre-packed on host); gfx942 SW path consumes f32.
@@ -697,6 +689,31 @@ def compile_fp8_grouped_gemm(
                 k_base_div4 = None
                 k_bound = None
 
+            # A and D are addressed from this group's first row rather than from
+            # the operand's, for the reason B is: a whole operand can exceed what
+            # one descriptor reaches. A packed A at 300k rows of K=8192 in BF16
+            # is 4.6 GB with only four groups, so this is not the many-expert
+            # case alone. Rows inside the loaders and the epilogue are then
+            # group-local, and the group's own extent bounds each descriptor.
+            a_group_rows = fx.Index(group_m_size_i32)
+            a_row_base = fx.Index(group_m_start_i32)
+            a_rsrc = rebased_resource(
+                arg_a,
+                a_group_rows * k_bytes_in,
+                byte_offset=a_row_base * k_bytes_in,
+            )
+            # Where the groups divide N the output rows are already slab-local,
+            # so the group is in the column and there is no row base to take.
+            d_row_base = fx.Index(0) if const_expr(n_grouped) else a_row_base
+            d_base_bytes = d_row_base * d_row_bytes
+            if d_group_off is not None:
+                # The groups divide K, so each owns a whole [M, N] output.
+                d_base_bytes = d_base_bytes + d_group_off * fx.Index(2)
+            d_group_rows = d_rows if const_expr(n_grouped) else a_group_rows
+            d_rsrc = rebased_resource(
+                arg_d, d_group_rows * d_row_bytes, byte_offset=d_base_bytes
+            )
+
             _t = compute_mfma_tiling(
                 tile_m=tile_m, tile_n=tile_n, waves_m=waves_m, waves_n=waves_n
             )
@@ -752,7 +769,8 @@ def compile_fp8_grouped_gemm(
                 a_rsrc=a_rsrc,
                 lds_a=lds_a,
                 layout_lds=layout_lds,
-                bx_m=bx_m,
+                # Group-local: a_rsrc is based at this group's first row.
+                bx_m=bx_m - a_row_base,
                 tx=tx,
                 tile_m=tile_m,
                 tile_k=tile_k,
@@ -1087,7 +1105,7 @@ def compile_fp8_grouped_gemm(
                 c_n=c_n,
                 n_padding=n_padding,
                 n_bound=n_bound,
-                d_group_off=d_group_off,
+                d_row_base=d_row_base,
             )
 
             # Mask the partial-tile tail: skip stores for global rows at or beyond
