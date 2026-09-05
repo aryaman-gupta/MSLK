@@ -880,9 +880,12 @@ def compile_fp8_grouped_gemm(
                     by_n=by_n,
                     # The base carries the group when B is based per group, so
                     # the row offset must not carry it too.
+                    # No group term where the base already carries it, and
+                    # none where B has no group axis to carry: the layouts that
+                    # divide N or K give every block one shared matrix.
                     b_group_off=(
                         None
-                        if group_based_b
+                        if (group_based_b or n_grouped or k_grouped)
                         else group_idx * n_in * (k_bytes_in // fx.Index(4))
                     ),
                     tx=tx,
