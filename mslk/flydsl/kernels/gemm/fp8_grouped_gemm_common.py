@@ -857,14 +857,16 @@ def make_b_tile_loaders(
     n_padding=False,
     n_bound=None,
     k_base_div4=None,
+    b_group_off=None,
 ):
     """Build the prefetch + LDS-store closures for a PLAIN (non-preshuffled)
     B tile [tile_n, tile_k].
 
     Mirror of `make_a_tile_loaders` with N in place of M. Addresses are relative
-    to the slab `b_rsrc` is based at, which the caller has already positioned on
-    this block's group, so nothing here carries a group term: the row is just
-    `by_n` (the block's N-block start) plus its tile-local offset. `n_bound`
+    to whatever `b_rsrc` is based at. Where that is this block's group the base
+    carries the group and `b_group_off` is None, leaving the row as `by_n` plus
+    its tile-local offset; where the descriptor spans the whole stack instead,
+    `b_group_off` is the group's leading offset in dwords and is added here. `n_bound`
     replaces the row bound the tail masks against, which is the group's column
     end rather than N where the groups divide the columns. Coalesced 16-byte
     (dwordx4) loads via `tile_chunk_coord_i32`; LDS store uses the same XOR16
@@ -907,8 +909,10 @@ def make_b_tile_loaders(
             base_k_div4 = k_base_div4 + base_k_div4
         parts = []
         for i in range_constexpr(num_b_loads):
-            row_global = by_n + b_row_local[i]  # N row within this group's slab
+            row_global = by_n + b_row_local[i]  # N row within B's own frame
             idx_i32 = row_global * _k_div4_factor + base_k_div4 + b_col_local_i32[i]
+            if b_group_off is not None:
+                idx_i32 = b_group_off + idx_i32
             kmask = _k_tail_mask(k_tile_idx_py, base_k_div4, b_col_local_i32[i])
             if n_padding:
                 # Rows past N hold the next group's weights, so read zero instead.
@@ -1968,6 +1972,7 @@ def make_n_block_coords(
     kpack_bytes,
     elem_bytes,
     scale_block_n,
+    b_group_based=False,
     scale_k,
     n_per_wave,
     num_acc_n,
@@ -1992,27 +1997,31 @@ def make_n_block_coords(
         n_block_for_scale.append(n_blk)
 
     # The preshuffle rearranges only the trailing (N, K) and leaves the group
-    # axis alone, so a group's weights stay one contiguous [N, K] block. The B
-    # descriptor is based at this block's group, which makes these coordinates
-    # group-local: the layout spans n_in rather than the whole stack, and the
-    # column carries no group term. Keeping the group in the column instead
-    # would put it in a 32-bit buffer offset, which a stack of experts overruns.
+    # axis alone, so a group's weights stay one contiguous [N, K] block, and the
+    # group can sit either in the descriptor's base or in these coordinates.
+    # Based per group, the layout spans n_in and the column carries no group
+    # term; spanning the whole stack, both take it back. The base is the only
+    # form a stack over 4 GiB can use, since the column is a 32-bit offset, but
+    # it is the more expensive one here: B goes HBM->registers inside the K loop
+    # on this path, so its descriptor is on the critical path of every load.
+    c_n_total = n_in if b_group_based else num_groups_in * n_in
     b_layout = make_preshuffle_b_layout(
         arith,
-        c_n=n_in,
+        c_n=c_n_total,
         c_k=k_in,
         kpack_bytes=kpack_bytes,
         elem_bytes=elem_bytes,
     )
     layout_b = b_layout.layout_b
 
-    c_n0 = n_in // fx.Index(16)
+    c_n0 = c_n_total // fx.Index(16)
     c_n0_i32 = arith.index_cast(T.i32, c_n0)
     layout_n_blk_intra = fx.make_layout((c_n0_i32, 16), stride=(16, 1))
     n_blk_list = []
     n_intra_list = []
+    group_n_off = fx.Index(0) if b_group_based else group_idx * n_in
     for ni in range_constexpr(num_acc_n):
-        col_global = by_n + n_tile_base + (ni * 16) + lane_mod_16
+        col_global = group_n_off + by_n + n_tile_base + (ni * 16) + lane_mod_16
         coord_ni = fx.idx2crd(fx.Int32(col_global), layout_n_blk_intra)
         n_blk_list.append(fx.get(coord_ni, 0))
         n_intra_list.append(fx.get(coord_ni, 1))

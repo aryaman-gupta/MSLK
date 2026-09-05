@@ -185,16 +185,19 @@ _BUFFER_LIMIT_BYTES = 1 << 32
 def _addressing_plan(total_M, N, K, G, elem_bytes, layout):
     """Decide whether A and D need per-group basing, and reject the unreachable.
 
-    B is always based at its group: a weight stack passes the limit at any
-    realistic expert count, and its group comes from the block index, so the
-    descriptor costs nothing to build. A and D are different -- theirs depends
-    on the group resolution, so basing them delays the first loads behind it and
-    measures about a quarter of the runtime on the FP8 groupwise shapes. They
-    keep addressing rows globally while their whole extent still fits one
-    descriptor, and only switch when it does not.
+    Every operand keeps addressing its whole self while that self still fits one
+    descriptor, and switches to its group's base only when it does not. None of
+    the basing is free: on the preshuffled-B path, whose weights go
+    HBM->registers inside the K loop rather than through LDS, basing B costs
+    40-55% at tile_n=256, and basing A and D costs about a quarter of the
+    runtime on the FP8 groupwise shapes.
 
-    Returns ``group_based_rows``. Raises where even one group would not fit,
-    which no basing can rescue.
+    B's threshold is exact -- ``G * N * K`` is entirely host-known -- while A's
+    and D's is a bound, since the packed layouts keep their group row counts on
+    the device.
+
+    Returns ``(group_based_b, group_based_rows)``. Raises where even one group
+    would not fit, which no basing can rescue.
 
     Only extents the host knows are checked. Where the groups are packed along M
     their row counts live on the device, so a per-group extent cannot be
@@ -207,8 +210,18 @@ def _addressing_plan(total_M, N, K, G, elem_bytes, layout):
     a_whole = total_M * K * elem_bytes
     group_based_rows = a_whole >= _BUFFER_LIMIT_BYTES or d_whole >= _BUFFER_LIMIT_BYTES
 
-    # B is per-group whatever happens, so its per-group extent always has to fit.
-    checks = [("B (one group's weights)", N * K * elem_bytes)]
+    # Where the groups divide N or K, B is a single matrix every block reads
+    # whole, so there is no group axis to base on and its whole extent is what
+    # has to fit.
+    b_stacked = layout not in ("n_offsets", "k_offsets")
+    b_whole = N * K * elem_bytes * (G if b_stacked else 1)
+    group_based_b = b_stacked and b_whole >= _BUFFER_LIMIT_BYTES
+
+    checks = []
+    if group_based_b or not b_stacked:
+        checks.append(("B (one group's weights)", N * K * elem_bytes))
+    else:
+        checks.append(("B (the whole weight stack)", b_whole))
     if group_based_rows:
         if layout in ("padded", "batched", "n_offsets"):
             # Every group owns the same fixed slab, so its height is host-known.
@@ -228,7 +241,7 @@ def _addressing_plan(total_M, N, K, G, elem_bytes, layout):
                 f"N={N} K={K} G={G} at {elem_bytes} B/element, layout {layout!r}. "
                 "Split the call along the axis that is too long."
             )
-    return group_based_rows
+    return group_based_b, group_based_rows
 
 
 def launch(
@@ -271,7 +284,9 @@ def launch(
 
     total_M, K = XQ.shape
     G, N = _group_and_n(WQ, m_sizes, layout)
-    group_based_rows = _addressing_plan(total_M, N, K, G, XQ.element_size(), layout)
+    group_based_b, group_based_rows = _addressing_plan(
+        total_M, N, K, G, XQ.element_size(), layout
+    )
     if b_preshuffled and (K % tile_k != 0 or N % tile_n != 0):
         raise ValueError(
             f"n ({N}) and k ({K}) must be divisible by tile_n ({tile_n}) and "
@@ -318,6 +333,7 @@ def launch(
         # A group's column end is a runtime value when the groups divide N, so
         # the tail mask is always needed there.
         n_padding=(N % tile_n != 0) or layout == "n_offsets",
+        group_based_b=group_based_b,
         group_based_rows=group_based_rows,
     )
     # Operands keep their natural shape: argument marshalling packs each memref

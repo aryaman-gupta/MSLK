@@ -137,6 +137,7 @@ def compile_fp8_grouped_gemm(
     layout: str = "sizes",
     k_padding: bool = False,
     n_padding: bool = False,
+    group_based_b: bool = False,
     group_based_rows: bool = False,
     roll_k: bool = False,
 ):
@@ -171,6 +172,17 @@ def compile_fp8_grouped_gemm(
         n_padding: Emit the per-store column predicate so N need only reach an
             8-column store boundary rather than a whole tile. Forced on where
             the groups divide N, for the same reason.
+        group_based_b: Address B from the owning group's first row rather than
+            from the stack's, and bound the descriptor by that group. Needed
+            once the whole stack passes the 4 GiB a buffer descriptor reaches,
+            which a realistic expert count does: 128 experts of 16384x5120 in
+            BF16 is 21.5 GB. It is not free either, and least so where it might
+            have seemed so -- on the preshuffled path B goes HBM->registers
+            inside the K loop rather than staging through LDS, so its descriptor
+            sits on the critical path of every B load, and basing it costs
+            40-55% at tile_n=256. The host therefore sets it only for stacks
+            that need it, which it can decide exactly, G * N * K being wholly
+            host-known.
         group_based_rows: Address A and D from the owning group's first row
             rather than from the operand's, and bound each descriptor by that
             group rather than by the whole operand. Needed once A or D passes
@@ -414,10 +426,11 @@ def compile_fp8_grouped_gemm(
     # The row basing changes the emitted kernel, so it has to reach the name or
     # the two forms would collide in the JIT cache.
     _gbr = "_gbr" if group_based_rows else ""
+    _gbb = "_gbb" if group_based_b else ""
     module_name = (
         f"grouped_gemm_{in_dtype}_{_scaling}_{layout}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_wpe}{_wg}{_gbr}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_wpe}{_wg}{_gbr}{_gbb}"
     ).replace("-", "_")
 
     # The AMDGPU default caps a workgroup at 256 threads, so a grid of more than
@@ -545,6 +558,13 @@ def compile_fp8_grouped_gemm(
         # whole operand, so that none of them has to address more than one
         # group's worth. See `rebased_resource`.
         b_nbytes = n_in * k_bytes_in
+        # What one descriptor must cover when it is not based at a group.
+        b_whole_nbytes = (
+            b_nbytes if (n_grouped or k_grouped) else num_groups_in * b_nbytes
+        )
+        b_rsrc_whole = (
+            None if group_based_b else rebased_resource(arg_b, b_whole_nbytes)
+        )
 
         # The output is [M, total_N] when the groups divide N: m_in counts the
         # rows of every group's slab, but they share the output's rows.
@@ -671,12 +691,15 @@ def compile_fp8_grouped_gemm(
             # stack of num_groups [N, K] ones otherwise. Only the stack has a
             # group axis to fold into the base; the single matrix is already one
             # slab, which every block reads whole.
-            if const_expr(n_grouped or k_grouped):
-                b_rsrc = rebased_resource(arg_b, b_nbytes)
-            else:
+            if const_expr(group_based_b):
                 b_rsrc = rebased_resource(
                     arg_b, b_nbytes, byte_offset=group_idx * b_nbytes
                 )
+            else:
+                # One descriptor over the whole stack, so the group stays in the
+                # coordinates rather than in the base. Built before this branch,
+                # needing no group to build.
+                b_rsrc = b_rsrc_whole
 
             # Global row base of this tile and the exclusive row end of its group
             # (the group end masks the partial-tile tail in the epilogue store).
@@ -764,6 +787,7 @@ def compile_fp8_grouped_gemm(
                 lane_mod_16=lane_mod_16,
                 kpack_bytes=kpack_bytes,
                 elem_bytes=elem_bytes,
+                b_group_based=group_based_b,
                 scale_block_n=scale_block_n,
                 scale_k=scale_k,
                 n_per_wave=n_per_wave,
@@ -854,6 +878,13 @@ def compile_fp8_grouped_gemm(
                     lds_b=lds_b,
                     layout_lds_b=layout_lds_b,
                     by_n=by_n,
+                    # The base carries the group when B is based per group, so
+                    # the row offset must not carry it too.
+                    b_group_off=(
+                        None
+                        if group_based_b
+                        else group_idx * n_in * (k_bytes_in // fx.Index(4))
+                    ),
                     tx=tx,
                     tile_n=tile_n,
                     tile_k=tile_k,
