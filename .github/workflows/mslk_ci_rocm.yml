@@ -50,6 +50,11 @@ on:
       - 'mslk/gemm/flydsl/**'
       # Arbitrates which backend serves each GEMM op on ROCm
       - 'mslk/gemm/__init__.py'
+      - 'mslk/gemm/_meta.py'
+      # aiter backends, their tuning tables and tuning scripts
+      - 'mslk/gemm/aiter/**'
+      - 'test/aiter/**'
+      - 'bench/aiter/**'
       # GEMM tests
       - 'test/gemm/gemm_test.py'
       # AMD/ROCm Triton GEMM kernels
