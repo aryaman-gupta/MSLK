@@ -53,6 +53,7 @@ on:
       - 'mslk/gemm/_meta.py'
       # aiter backends, their tuning tables and tuning scripts
       - 'mslk/gemm/aiter/**'
+      - 'mslk/gemm/dispatch/**'
       - 'test/aiter/**'
       - 'bench/aiter/**'
       # GEMM tests

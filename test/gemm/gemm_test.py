@@ -26,7 +26,7 @@ from mslk.flydsl.common import (
     is_flydsl_version_at_least,
     MIN_FLYDSL_VERSION,
 )
-from mslk.gemm.aiter.f4f4bf16 import OP as F4F4BF16_AITER_OP
+from mslk.gemm.dispatch.f4f4bf16 import OP as F4F4BF16_OP
 from mslk.quantize.triton.fp4_quantize import (
     _to_blocked,
     calculate_group_max,
@@ -3265,7 +3265,7 @@ class MXFP4Tests(unittest.TestCase):
         bq, b_scale = triton_quantize_mx4_unpack(B)
 
         with (
-            force_backend(F4F4BF16_AITER_OP, backend)
+            force_backend(F4F4BF16_OP, backend)
             if backend != "default"
             else contextlib.nullcontext()
         ):
@@ -3286,7 +3286,7 @@ class MXFP4Tests(unittest.TestCase):
         rows = [
             row
             for row in csv.DictReader(
-                importlib.resources.files("mslk.gemm.aiter")
+                importlib.resources.files("mslk.gemm.dispatch")
                 .joinpath("tables/f4f4bf16.csv")
                 .read_text()
                 .splitlines()

@@ -10,7 +10,7 @@
 
 Compares MSLK's Triton kernel with aiter's ``gemm_afp4wfp4`` on every shape in
 ``bench/aiter/untuned/f4f4bf16.csv`` and updates
-``mslk/gemm/aiter/tables/f4f4bf16.csv``. The tuning itself (incremental runs,
+``mslk/gemm/dispatch/tables/f4f4bf16.csv``. The tuning itself (incremental runs,
 multi-GPU, timing, choosing) is :mod:`mslk.aiter.tuning`; this file holds only
 what is specific to the op. Needs the pinned aiter and a gfx950 GPU.
 
@@ -32,7 +32,7 @@ import mslk.gemm  # noqa: F401  (registers mslk::f4f4bf16)
 import torch
 from mslk.aiter import tuning
 from mslk.aiter.tuning import OpTuner, Row
-from mslk.gemm.aiter.f4f4bf16 import BACKENDS, OP
+from mslk.gemm.dispatch.f4f4bf16 import BACKENDS, OP
 from mslk.quantize.triton.fp4_quantize import triton_quantize_mx4_unpack
 
 REPO = Path(__file__).resolve().parents[2]
@@ -96,5 +96,5 @@ if __name__ == "__main__":
     tuning.main(
         F4F4BF16Tuner(),
         untune_file=str(REPO / "bench" / "aiter" / "untuned" / "f4f4bf16.csv"),
-        tune_file=str(REPO / "mslk" / "gemm" / "aiter" / "tables" / "f4f4bf16.csv"),
+        tune_file=str(REPO / "mslk" / "gemm" / "dispatch" / "tables" / "f4f4bf16.csv"),
     )

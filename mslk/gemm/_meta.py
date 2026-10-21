@@ -570,9 +570,9 @@ if hasattr(torch.ops.mslk, "f8f8f16_rowwise_preshuffle"):
 
 # ---------------------------------------------------------------------------
 # ROCm-only fallback: define mslk::f4f4bf16 in Python when the CUDA C++ op
-# isn't present. Dispatches to native MXFP4 Triton on gfx950 only — see
-# mslk/gemm/triton/f4f4bf16.py — or, for the shapes its tuning table assigns
-# to aiter, to aiter's kernel (mslk/gemm/aiter/f4f4bf16.py).
+# isn't present. mslk/gemm/dispatch/f4f4bf16.py picks the backend per call:
+# native MXFP4 Triton on gfx950 (mslk/gemm/triton/f4f4bf16.py), or aiter for
+# the shapes its tuning table assigns to aiter.
 # ---------------------------------------------------------------------------
 
 if not hasattr(torch.ops.mslk, "f4f4bf16") and torch.version.hip is not None:
@@ -592,18 +592,10 @@ if not hasattr(torch.ops.mslk, "f4f4bf16") and torch.version.hip is not None:
         global_scale: Optional[torch.Tensor] = None,
         mxfp4_block_size: int = 32,
     ) -> torch.Tensor:
-        # aiter only computes standard MXFP4; other calls keep going to the
-        # Triton path, which rejects them as before.
-        if global_scale is None and mxfp4_block_size == 32:
-            from mslk.gemm.aiter import f4f4bf16 as _aiter_f4f4bf16
+        # Imported on first call, like the backends it chooses between.
+        from mslk.gemm.dispatch.f4f4bf16 import f4f4bf16 as _dispatch_f4f4bf16
 
-            if _aiter_f4f4bf16.backend_for(XQ, WQ) == _aiter_f4f4bf16.AITER:
-                return _aiter_f4f4bf16.f4f4bf16(XQ, WQ, x_scale, w_scale, output)
-
-        # Import lazily so importing mslk.gemm doesn't pull in triton on CPU-only nodes.
-        from mslk.gemm.triton.f4f4bf16 import f4f4bf16 as _triton_f4f4bf16
-
-        return _triton_f4f4bf16(
+        return _dispatch_f4f4bf16(
             XQ,
             WQ,
             x_scale,

@@ -8,7 +8,8 @@
 
 """aiter backends for MSLK GEMM ops on ROCm.
 
-Each module adapts one MSLK op to aiter's public op for the same computation,
-and owns the op's tuning table under ``tables/``. Importing these modules does
-not import aiter; see :mod:`mslk.aiter.common`.
+Each module adapts one MSLK op to aiter's public op for the same computation:
+it takes the op's arguments and calls aiter. Which calls an op's aiter backend
+serves is decided by the op's dispatch module (``mslk/gemm/dispatch/``).
+Importing these modules does not import aiter; see :mod:`mslk.aiter.common`.
 """

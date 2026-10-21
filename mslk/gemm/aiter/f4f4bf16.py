@@ -6,7 +6,7 @@
 
 # pyre-strict
 
-"""aiter backend for ``mslk::f4f4bf16`` (MXFP4 x MXFP4 -> BF16) on ROCm.
+"""aiter backend of ``mslk::f4f4bf16`` (MXFP4 x MXFP4 -> BF16) on ROCm.
 
 aiter's ``gemm_afp4wfp4`` computes what ``f4f4bf16`` computes on ROCm: FP4
 values packed two per byte (low nibble first), one E8M0 scale per 32 elements
@@ -15,39 +15,15 @@ so the op's arguments go to it unchanged.
 
 ``gemm_afp4wfp4`` also has a Gluon kernel for gfx950 (``backend="gluon"``).
 aiter does not use it by default there, and on plain (not preshuffled) weights
-it is one to two orders of magnitude slower, so it is not a candidate.
+it is one to two orders of magnitude slower, so it is not used.
 
-Which backend serves a call is decided by ``tables/f4f4bf16.csv``, written by
-``bench/aiter/tune_f4f4bf16.py``.
+Which calls this backend serves is decided in ``mslk/gemm/dispatch/f4f4bf16.py``.
 """
 
-import functools
 from typing import Optional
 
 import torch
 from mslk.aiter.common import import_aiter_module
-from mslk.aiter.routing import choose_backend, MSLK, ShapeTable
-
-OP: str = "f4f4bf16"
-AITER: str = "aiter"
-BACKENDS: tuple[str, ...] = (MSLK, AITER)
-
-
-@functools.lru_cache(maxsize=1)
-def table() -> ShapeTable:
-    return ShapeTable.from_package(
-        "mslk.gemm.aiter",
-        "tables/f4f4bf16.csv",
-        key_columns=("N", "K"),
-        bucket_column="M_max",
-    )
-
-
-def backend_for(XQ: torch.Tensor, WQ: torch.Tensor) -> str:
-    """The backend that should serve ``f4f4bf16`` on these operands."""
-    M, K = XQ.shape[0], XQ.shape[1] * 2
-    N = WQ.shape[0]
-    return choose_backend(OP, table, XQ.get_device(), (N, K), M)
 
 
 def f4f4bf16(

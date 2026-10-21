@@ -10,8 +10,9 @@
 
 Each op that can be served by aiter has a tuning table, written by the op's
 tuning script (``bench/aiter/``, driven by :mod:`mslk.aiter.tuning`) and shipped
-with the package. A table is a CSV with one row per device, op-specific key and
-bucket::
+with the package next to the op's dispatch module (``mslk/gemm/dispatch/``),
+which reads it through :class:`OpRouting`. A table is a CSV with one row per
+device, op-specific key and bucket::
 
     gfx,cu_num,N,K,M_max,backend[,informational columns...]
     gfx950,256,8192,8192,64,aiter
@@ -138,3 +139,32 @@ def choose_backend(
     if not is_aiter_enabled(op):
         return MSLK
     return table().lookup(device_key(device_index), key, value) or MSLK
+
+
+class OpRouting:
+    """An op's routing: its name, for the switches and :func:`force_backend`,
+    and its tuning table, a CSV in a package, read on first use.
+
+    Each op's dispatch module (e.g. ``mslk/gemm/dispatch/f4f4bf16.py``) holds
+    one, and asks it which backend serves each call.
+    """
+
+    def __init__(
+        self,
+        op: str,
+        package: str,
+        resource: str,
+        key_columns: Sequence[str],
+        bucket_column: str,
+    ) -> None:
+        self.op = op
+        self._table_args = (package, resource, tuple(key_columns), bucket_column)
+
+    @functools.cached_property
+    def table(self) -> ShapeTable:
+        return ShapeTable.from_package(*self._table_args)
+
+    def backend(self, device_index: int, key: Sequence[object], value: int) -> str:
+        """The backend for a call on ``device_index`` with this key and bucket
+        value, e.g. ``(N, K)`` and ``M``."""
+        return choose_backend(self.op, lambda: self.table, device_index, key, value)
