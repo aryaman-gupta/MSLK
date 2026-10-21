@@ -8,19 +8,16 @@
 # pyre-ignore-all-errors[56]
 
 import contextlib
-import csv
-import importlib.resources
 import os
 import unittest
 from typing import Optional, Union
-from unittest import mock
 
 import mslk.gemm  # noqa: F401
 import mslk.quantize  # noqa: F401
 import torch
 import triton  # noqa: F401
 from mslk.aiter.common import is_aiter_available
-from mslk.aiter.routing import device_key, force_backend
+from mslk.aiter.routing import force_backend
 from mslk.flydsl.common import (
     flydsl_version,
     is_flydsl_version_at_least,
@@ -3273,51 +3270,6 @@ class MXFP4Tests(unittest.TestCase):
         out_bf16 = A @ B.t()
 
         torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
-
-    @skipUnlessRocm()
-    def test_gemm_follows_tuning_table(self) -> None:
-        """The op calls the backend its tuning table names for a shape."""
-        if not is_aiter_available():
-            self.skipTest("requires the pinned aiter")
-        import mslk.gemm.aiter.f4f4bf16 as aiter_f4f4bf16
-        import mslk.gemm.triton.f4f4bf16 as triton_f4f4bf16
-
-        device = device_key(torch.cuda.current_device())
-        rows = [
-            row
-            for row in csv.DictReader(
-                importlib.resources.files("mslk.gemm.dispatch")
-                .joinpath("tables/f4f4bf16.csv")
-                .read_text()
-                .splitlines()
-            )
-            if (row["gfx"], int(row["cu_num"])) == device
-        ]
-        # The cheapest shape for each backend is enough to show the routing.
-        rows.sort(key=lambda r: int(r["M_max"]) * int(r["N"]) * int(r["K"]))
-        checked = set()
-        for row in rows:
-            if row["backend"] in checked:
-                continue
-            checked.add(row["backend"])
-            M, N, K = int(row["M_max"]), int(row["N"]), int(row["K"])
-            A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
-            B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
-            aq, a_scale = triton_quantize_mx4_unpack(A)
-            bq, b_scale = triton_quantize_mx4_unpack(B)
-            with (
-                mock.patch.object(
-                    aiter_f4f4bf16, "f4f4bf16", wraps=aiter_f4f4bf16.f4f4bf16
-                ) as via_aiter,
-                mock.patch.object(
-                    triton_f4f4bf16, "f4f4bf16", wraps=triton_f4f4bf16.f4f4bf16
-                ) as via_mslk,
-            ):
-                torch.ops.mslk.f4f4bf16(aq, bq, a_scale, b_scale)
-            self.assertEqual(via_aiter.call_count, int(row["backend"] == "aiter"), row)
-            self.assertEqual(via_mslk.call_count, int(row["backend"] == "mslk"), row)
-        if not checked:
-            self.skipTest(f"no tuning-table rows for {device}")
 
     @parameterized.expand(
         [

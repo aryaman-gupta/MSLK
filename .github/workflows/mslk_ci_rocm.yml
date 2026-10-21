@@ -58,6 +58,7 @@ on:
       - 'bench/aiter/**'
       # GEMM tests
       - 'test/gemm/gemm_test.py'
+      - 'test/gemm/dispatch_test.py'
       # AMD/ROCm Triton GEMM kernels
       - 'mslk/gemm/triton/**'
       # HIP source files (AMD GPU kernels)
