@@ -9,8 +9,9 @@
 """Per-shape choice between MSLK's own kernel and aiter, for one op at a time.
 
 Each op that can be served by aiter has a tuning table, written by the op's
-tuning script (``bench/aiter/``) and shipped with the package. A table is a CSV
-with one row per device, op-specific key and bucket::
+tuning script (``bench/aiter/``, driven by :mod:`mslk.aiter.tuning`) and shipped
+with the package. A table is a CSV with one row per device, op-specific key and
+bucket::
 
     gfx,cu_num,N,K,M_max,backend[,informational columns...]
     gfx950,256,8192,8192,64,aiter
@@ -48,16 +49,16 @@ class ShapeTable:
     ) -> None:
         self.key_columns: Tuple[str, ...] = tuple(key_columns)
         self.bucket_column: str = bucket_column
-        buckets: Dict[Tuple[object, ...], List[Tuple[int, str]]] = {}
+        # Keys are compared as strings, so key columns can hold any value
+        # (sizes, dtypes, ...); only the bucket column is numeric.
+        buckets: Dict[Tuple[str, ...], List[Tuple[int, str]]] = {}
         for row in rows:
-            key = (row["gfx"], int(row["cu_num"])) + tuple(
-                int(row[c]) for c in self.key_columns
-            )
+            key = (row["gfx"], row["cu_num"]) + tuple(row[c] for c in self.key_columns)
             buckets.setdefault(key, []).append(
                 (int(row[bucket_column]), row["backend"])
             )
-        self._bounds: Dict[Tuple[object, ...], List[int]] = {}
-        self._backends: Dict[Tuple[object, ...], List[str]] = {}
+        self._bounds: Dict[Tuple[str, ...], List[int]] = {}
+        self._backends: Dict[Tuple[str, ...], List[str]] = {}
         for key, entries in buckets.items():
             entries.sort()
             self._bounds[key] = [bound for bound, _ in entries]
@@ -75,11 +76,11 @@ class ShapeTable:
         return cls(list(csv.DictReader(text.splitlines())), key_columns, bucket_column)
 
     def lookup(
-        self, device: _DeviceKey, key: Sequence[int], value: int
+        self, device: _DeviceKey, key: Sequence[object], value: int
     ) -> Optional[str]:
         """The backend for ``value`` (e.g. M) under ``key`` (e.g. (N, K)), or
         ``None`` when the table does not cover it."""
-        full_key = tuple(device) + tuple(key)
+        full_key = tuple(str(k) for k in tuple(device) + tuple(key))
         bounds = self._bounds.get(full_key)
         # Empty calls (e.g. M=0) are never tuned; MSLK's kernel handles them.
         if bounds is None or value < 1:
@@ -123,7 +124,7 @@ def choose_backend(
     op: str,
     table: Callable[[], ShapeTable],
     device_index: int,
-    key: Sequence[int],
+    key: Sequence[object],
     value: int,
 ) -> str:
     """The backend that should serve this call of ``op``.

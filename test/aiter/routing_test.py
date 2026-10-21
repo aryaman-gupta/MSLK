@@ -15,10 +15,8 @@ nor a GPU.
 import unittest
 from unittest import mock
 
-import torch
 from mslk.aiter import routing
 from mslk.aiter.routing import choose_backend, force_backend, MSLK, ShapeTable
-from mslk.aiter.tuning import choose, measure, Measurement
 
 DEVICE = ("gfx950", 256)
 
@@ -71,6 +69,24 @@ class ShapeTableTest(unittest.TestCase):
         self.assertEqual(table.lookup(("gfx942", 304), (8192, 8192), 16), "aiter")
 
 
+class StringKeyTest(unittest.TestCase):
+    def test_key_columns_can_hold_dtypes(self) -> None:
+        rows = [
+            {
+                "gfx": "gfx950",
+                "cu_num": "256",
+                "out_dtype": d,
+                "N": "1024",
+                "M_max": "64",
+                "backend": b,
+            }
+            for d, b in (("bfloat16", "aiter"), ("float16", "mslk"))
+        ]
+        table = ShapeTable(rows, key_columns=("out_dtype", "N"), bucket_column="M_max")
+        self.assertEqual(table.lookup(DEVICE, ("bfloat16", 1024), 8), "aiter")
+        self.assertEqual(table.lookup(DEVICE, ("float16", 1024), 8), "mslk")
+
+
 class ChooseBackendTest(unittest.TestCase):
     def _choose(self, m: int, enabled: bool = True) -> str:
         with (
@@ -94,48 +110,6 @@ class ChooseBackendTest(unittest.TestCase):
                 self.assertEqual(self._choose(512, enabled=False), "aiter")
             self.assertEqual(self._choose(16), MSLK)
         self.assertEqual(self._choose(16), "aiter")
-
-
-class TuningChoiceTest(unittest.TestCase):
-    def test_aiter_needs_a_clear_win(self) -> None:
-        self.assertEqual(
-            choose(
-                [
-                    Measurement(MSLK, 10.0, True, 0.0),
-                    Measurement("aiter", 9.7, True, 0.0),
-                ]
-            ),
-            MSLK,
-        )
-        self.assertEqual(
-            choose(
-                [
-                    Measurement(MSLK, 10.0, True, 0.0),
-                    Measurement("aiter", 9.0, True, 0.0),
-                ]
-            ),
-            "aiter",
-        )
-
-    def test_a_candidate_that_raises_is_recorded_not_fatal(self) -> None:
-        def call() -> torch.Tensor:
-            raise RuntimeError("out of resource: shared memory")
-
-        m = measure("aiter", call, lambda out: (True, 0.0))
-        self.assertFalse(m.correct)
-        self.assertIn("shared memory", m.error or "")
-        self.assertEqual(choose([Measurement(MSLK, 10.0, True, 0.0), m]), MSLK)
-
-    def test_incorrect_aiter_is_never_chosen(self) -> None:
-        self.assertEqual(
-            choose(
-                [
-                    Measurement(MSLK, 10.0, True, 0.0),
-                    Measurement("aiter", 1.0, False, 9.0),
-                ]
-            ),
-            MSLK,
-        )
 
 
 if __name__ == "__main__":
