@@ -14,11 +14,14 @@ Compares MSLK's Triton kernel with aiter's ``gemm_afp4wfp4`` on every shape in
 multi-GPU, timing, choosing) is :mod:`mslk.aiter.tuning`; this file holds only
 what is specific to the op. Needs the pinned aiter and a gfx950 GPU.
 
-Correctness follows ``MXFP4Tests.test_gemm``: the same inputs and tolerance
-(atol = rtol = 8e-2). The reference is the product of the dequantized inputs
-rather than of the original ones, so that the check measures the kernel and
-not FP4 quantization, whose error grows with K beyond what the test's shapes
-reach.
+Correctness: the reference is the product of the dequantized inputs, i.e.
+exactly what the kernels compute up to FP32 summation order and the BF16
+rounding of the output, so quantization error plays no part. The tolerance is
+therefore tight: rtol = atol = 1e-2, aiter's default, about 2.5x BF16's
+rounding error. Inputs are unit-scale, so the outputs (standard deviation about
+sqrt(K)) are far larger than atol at every K, and a wrong or partial result
+cannot pass. (The unit test's tolerance, 8e-2 on inputs scaled by 0.1 and
+0.01, absorbs quantization error and is wider than the outputs at small K.)
 
 Example, on four GPUs (run from the repository root):
 
@@ -57,13 +60,13 @@ class F4F4BF16Tuner(OpTuner):
     key_columns = ("N", "K")
     bucket_column = "M_max"
     backends = BACKENDS
-    atol = rtol = 8e-2  # MXFP4Tests.test_gemm
+    atol = rtol = 1e-2
+    outputs = ("out",)
 
     def make_inputs(self, shape: Row) -> Dict[str, Any]:
         M, N, K = int(shape["M_max"]), int(shape["N"]), int(shape["K"])
-        # As in MXFP4Tests.test_gemm.
-        A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
-        B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.01
+        A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
         aq, a_scale = triton_quantize_mx4_unpack(A)
         bq, b_scale = triton_quantize_mx4_unpack(B)
         out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)

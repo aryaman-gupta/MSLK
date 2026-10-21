@@ -30,9 +30,11 @@ tuners (``aiter/utility/base_tuner.py``):
   (``--rotate_mb``), so that every call reads its operands from memory, as in
   a model where other layers evict them; aiter's ``perftest`` does the same.
   Backends are timed in alternating order from shape to shape.
-- **Correctness** is checked through the op itself (backend forced) against
-  the reference and tolerance of the op's unit test. Every element must be
-  within tolerance; the table also records the error (``err_ratio``: fraction
+- **Correctness** is checked through the op itself (backend forced), against
+  the op's reference and tolerance, which should be tight enough that a wrong
+  or partial result cannot pass at any shape in the list. Every element must
+  be within tolerance (NaN never is), and outputs are filled with NaN before
+  each backend runs. The table also records the error (``err_ratio``: fraction
   of elements outside tolerance, as in aiter's tables, and ``max_abs_err``).
 - **Choosing.** MSLK's kernel is the default. Another backend is chosen only if
   it is correct and at least ``--min_improvement_pct`` faster (default 3%,
@@ -113,9 +115,13 @@ class OpTuner(abc.ABC):
     bucket_column: str
     #: Candidate backends; MSLK's kernel first.
     backends: Tuple[str, ...]
-    #: Tolerances of the op's unit test.
+    #: Tolerances of the correctness check.
     atol: float
     rtol: float
+    #: Keys of :meth:`make_inputs` that the op writes, e.g. an output buffer.
+    #: They are filled with NaN before each backend's check, so that results a
+    #: backend failed to write are not taken from another backend's run.
+    outputs: Tuple[str, ...] = ()
 
     @abc.abstractmethod
     def make_inputs(self, shape: Row) -> Dict[str, Any]:
@@ -349,7 +355,8 @@ def _error_stats(
     tuner: OpTuner, out: torch.Tensor, ref: torch.Tensor
 ) -> Tuple[float, float]:
     err = (out.float() - ref.float()).abs()
-    outside = err > tuner.atol + tuner.rtol * ref.float().abs()
+    # Negated so that NaN or inf in the output counts as outside tolerance.
+    outside = ~(err <= tuner.atol + tuner.rtol * ref.float().abs())
     return outside.float().mean().item(), err.max().item()
 
 
@@ -373,6 +380,8 @@ def tune_shape(
     for backend in order:
         with force_backend(tuner.op, backend):
             try:
+                for name in tuner.outputs:
+                    inputs[name].fill_(float("nan"))
                 err_ratio, max_err = _error_stats(tuner, tuner.run(inputs), ref)
                 correct = err_ratio == 0.0
                 us = time_us(tuner, copies, settings.warmup, settings.iters)
@@ -521,20 +530,26 @@ def main(tuner: OpTuner, untune_file: str, tune_file: str) -> None:
         else:
             ctx = mp.get_context("spawn")
             gpus = ctx.Queue()
-            for g in range(min(args.mp, torch.cuda.device_count())):
+            n_workers = min(args.mp, torch.cuda.device_count())
+            for g in range(n_workers):
                 gpus.put(g)
-            with ProcessPoolExecutor(
-                max_workers=min(args.mp, torch.cuda.device_count()),
+            pool = ProcessPoolExecutor(
+                max_workers=n_workers,
                 mp_context=ctx,
                 initializer=_worker_init,
                 initargs=(gpus,),
-            ) as pool:
+            )
+            try:
                 futures = [
                     pool.submit(tune_shape, tuner, shape, settings, i % 2 == 1)
                     for i, shape in enumerate(todo)
                 ]
                 for future in as_completed(futures):
                     collect(future.result())
+            finally:
+                # On an error or Ctrl-C, drop the queued shapes instead of
+                # waiting for all of them; only those already running finish.
+                pool.shutdown(wait=False, cancel_futures=True)
     except BaseException:
         # Keep what was measured (e.g. a worker died on a GPU fault); running
         # the script again resumes from here.

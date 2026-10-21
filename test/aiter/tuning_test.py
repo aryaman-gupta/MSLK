@@ -20,6 +20,7 @@ from typing import Any, Dict
 import torch
 from mslk.aiter.routing import MSLK
 from mslk.aiter.tuning import (
+    _error_stats,
     choose,
     Measurement,
     merge_rows,
@@ -143,6 +144,14 @@ class RowFormatTest(unittest.TestCase):
         self.assertEqual(row["aiter_us"], "")
         self.assertNotIn("inf", ",".join(row.values()))
         self.assertEqual(list(row), _Tuner().table_columns())
+
+
+class ErrorStatsTest(unittest.TestCase):
+    def test_nan_and_inf_count_as_outside_tolerance(self) -> None:
+        ref = torch.ones(4)
+        out = torch.tensor([1.0, float("nan"), float("inf"), 1.005])
+        err_ratio, _ = _error_stats(_Tuner(), out, ref)
+        self.assertEqual(err_ratio, 0.5)
 
 
 class RotationTest(unittest.TestCase):
