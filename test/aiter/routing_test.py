@@ -15,8 +15,15 @@ nor a GPU.
 import unittest
 from unittest import mock
 
+import torch
 from mslk.aiter import routing
-from mslk.aiter.routing import choose_backend, force_backend, MSLK, ShapeTable
+from mslk.aiter.routing import (
+    choose_backend,
+    force_backend,
+    MSLK,
+    OpRouting,
+    ShapeTable,
+)
 
 DEVICE = ("gfx950", 256)
 
@@ -110,6 +117,45 @@ class ChooseBackendTest(unittest.TestCase):
                 self.assertEqual(self._choose(512, enabled=False), "aiter")
             self.assertEqual(self._choose(16), MSLK)
         self.assertEqual(self._choose(16), "aiter")
+
+
+class OpRoutingTest(unittest.TestCase):
+    """The choose-and-call logic every op's dispatch module relies on, with a
+    fake op ``op(x, n, k, ok=True)`` whose key is ``((n, k), rows of x)``."""
+
+    def setUp(self) -> None:
+        self.backends = {
+            MSLK: mock.Mock(return_value="from mslk"),
+            "aiter": mock.Mock(return_value="from aiter"),
+        }
+        self.routing = OpRouting(
+            "op",
+            "unused.package",
+            "unused.csv",
+            ("N", "K"),
+            "M_max",
+            backends=self.backends,  # pyre-ignore[6]
+            key=lambda x, n, k, **kw: ((n, k), x.shape[0]),
+            accepts={"aiter": lambda x, n, k, ok=True: ok},
+        )
+        self.routing.__dict__["table"] = _table()  # instead of reading a package
+        for name, value in (("is_aiter_enabled", True), ("device_key", DEVICE)):
+            patcher = mock.patch.object(routing, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_calls_the_backend_its_table_names_with_the_op_arguments(self) -> None:
+        x = torch.empty(16, 1)
+        self.assertEqual(self.routing(x, 8192, 8192), "from aiter")
+        self.backends["aiter"].assert_called_once_with(x, 8192, 8192)
+        self.assertEqual(self.routing(torch.empty(512, 1), 8192, 8192), "from mslk")
+
+    def test_a_backend_that_cannot_take_the_call_falls_back_to_mslk(self) -> None:
+        x = torch.empty(16, 1)
+        self.assertEqual(self.routing(x, 8192, 8192, ok=False), "from mslk")
+        with force_backend("op", "aiter"):
+            self.assertEqual(self.routing(x, 8192, 8192, ok=False), "from mslk")
+        self.backends["aiter"].assert_not_called()
 
 
 if __name__ == "__main__":

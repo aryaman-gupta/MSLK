@@ -29,7 +29,7 @@ import csv
 import functools
 import importlib.resources
 from contextlib import contextmanager
-from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 from mslk.aiter.common import is_aiter_enabled
@@ -48,6 +48,7 @@ class ShapeTable:
         key_columns: Sequence[str],
         bucket_column: str,
     ) -> None:
+        self.rows: List[Dict[str, str]] = list(rows)
         self.key_columns: Tuple[str, ...] = tuple(key_columns)
         self.bucket_column: str = bucket_column
         # Keys are compared as strings, so key columns can hold any value
@@ -142,11 +143,21 @@ def choose_backend(
 
 
 class OpRouting:
-    """An op's routing: its name, for the switches and :func:`force_backend`,
-    and its tuning table, a CSV in a package, read on first use.
+    """Everything that routes one op: its backends, its tuning table, and how a
+    call maps onto the table. Calling it serves the call.
 
-    Each op's dispatch module (e.g. ``mslk/gemm/dispatch/f4f4bf16.py``) holds
-    one, and asks it which backend serves each call.
+    An op's dispatch module (e.g. ``mslk/gemm/dispatch/f4f4bf16.py``) only
+    declares these; choosing and calling are done here, the same way for every
+    op:
+
+    - ``backends`` maps each backend's name to a callable taking the op's
+      arguments; MSLK's kernel (:data:`MSLK`) is the default and fallback.
+    - ``key`` maps the op's arguments to the table key and bucket value, e.g.
+      ``((N, K), M)``. The first argument must be a tensor on the call's device.
+    - ``accepts`` optionally maps a backend's name to a predicate on the op's
+      arguments; a call a backend cannot take goes to MSLK's kernel instead,
+      even when the table or :func:`force_backend` chose that backend.
+    - The table is a CSV in a package, read on first use.
     """
 
     def __init__(
@@ -156,15 +167,31 @@ class OpRouting:
         resource: str,
         key_columns: Sequence[str],
         bucket_column: str,
+        backends: Dict[str, Callable[..., Any]],
+        key: Callable[..., Tuple[Sequence[object], int]],
+        accepts: Optional[Dict[str, Callable[..., bool]]] = None,
     ) -> None:
+        assert MSLK in backends, "MSLK's kernel must be one of the backends"
         self.op = op
+        self.backends = backends
+        self._key = key
+        self._accepts: Dict[str, Callable[..., bool]] = accepts or {}
         self._table_args = (package, resource, tuple(key_columns), bucket_column)
 
     @functools.cached_property
     def table(self) -> ShapeTable:
         return ShapeTable.from_package(*self._table_args)
 
-    def backend(self, device_index: int, key: Sequence[object], value: int) -> str:
-        """The backend for a call on ``device_index`` with this key and bucket
-        value, e.g. ``(N, K)`` and ``M``."""
-        return choose_backend(self.op, lambda: self.table, device_index, key, value)
+    def backend_for(self, *args: Any, **kwargs: Any) -> str:
+        """The backend that serves a call with these arguments."""
+        key, value = self._key(*args, **kwargs)
+        name = choose_backend(
+            self.op, lambda: self.table, args[0].get_device(), key, value
+        )
+        accepts = self._accepts.get(name)
+        if accepts is not None and not accepts(*args, **kwargs):
+            return MSLK
+        return name
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.backends[self.backend_for(*args, **kwargs)](*args, **kwargs)

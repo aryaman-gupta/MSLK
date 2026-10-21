@@ -593,9 +593,9 @@ if not hasattr(torch.ops.mslk, "f4f4bf16") and torch.version.hip is not None:
         mxfp4_block_size: int = 32,
     ) -> torch.Tensor:
         # Imported on first call, like the backends it chooses between.
-        from mslk.gemm.dispatch.f4f4bf16 import f4f4bf16 as _dispatch_f4f4bf16
+        from mslk.gemm.dispatch.f4f4bf16 import ROUTING as _f4f4bf16_routing
 
-        return _dispatch_f4f4bf16(
+        return _f4f4bf16_routing(
             XQ,
             WQ,
             x_scale,
