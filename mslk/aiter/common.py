@@ -12,10 +12,41 @@ aiter serves an op only when all of these hold:
 
 - this is a ROCm build of PyTorch and aiter is installed;
 - the installed aiter is exactly the build MSLK pins (``aiter_version.txt``),
-  the only one its ops are tested against, unless
-  ``MSLK_AITER_ALLOW_UNPINNED=1``;
-- aiter is not switched off, globally (``MSLK_DISABLE_AITER=1``) or for the op
-  (``MSLK_DISABLE_AITER_OPS``, a comma-separated list of op names).
+  the only one its ops are tested against, unless ``MSLK_AITER_ALLOW_UNPINNED``
+  is set;
+- aiter is not switched off, globally or for the op (see below).
+
+Within those limits, each op's tuning table decides which calls aiter serves.
+
+Environment variables
+---------------------
+
+All are optional; set them to ``1`` (or, for ``MSLK_DISABLE_AITER_OPS``, a
+list) before the process makes its first op call that could use aiter. They are
+read once, on first use, and not again; tests that change them call
+:func:`reset`.
+
+``MSLK_DISABLE_AITER=1``
+    Turns off every aiter path: all ops use MSLK's own kernels, as if aiter
+    were not installed. For ruling aiter out while debugging, comparing
+    performance with and without aiter, or working around a misbehaving aiter
+    kernel without uninstalling it.
+
+``MSLK_DISABLE_AITER_OPS=op1,op2``
+    Turns off the aiter path of the listed ops only (MSLK op names, e.g.
+    ``f4f4bf16``), which then always use MSLK's kernel; other ops still use
+    aiter where their tables say so. For when one op's aiter path has a problem.
+
+``MSLK_AITER_ALLOW_UNPINNED=1``
+    Uses the installed aiter even when it is not the pinned build. By default
+    such an aiter is not used, with one warning, because MSLK's tables and
+    tests only vouch for the pinned build. For experiments, e.g. trying a newer
+    aiter before moving the pin, or environments that build their own aiter;
+    not for production.
+
+The switches can only turn aiter off: neither makes aiter serve a call its
+table does not give it. Tests and tuning scripts choose a backend with
+:func:`mslk.aiter.routing.force_backend` instead.
 
 Nothing here imports aiter: checking runs on package metadata, and aiter is
 imported on the first call that uses it. Importing aiter is expensive (its
@@ -31,7 +62,7 @@ import importlib.util
 import logging
 import os
 from types import ModuleType
-from typing import Optional
+from typing import FrozenSet, Optional, Tuple
 
 import torch
 
@@ -97,17 +128,31 @@ def is_aiter_available() -> bool:
     return True
 
 
-def is_aiter_enabled(op: str) -> bool:
-    """True when aiter may serve ``op``: available and not switched off.
-
-    The switches are read on every call, so they can be changed at runtime.
-    """
-    if os.environ.get(DISABLE_ENV, "0") == "1":
-        return False
+@functools.lru_cache(maxsize=1)
+def _switches() -> Tuple[bool, FrozenSet[str]]:
+    """(all of aiter off, ops with aiter off), read from the environment once:
+    reading it on every call would add about 1 us of CPU time per eager op
+    call."""
     disabled_ops = os.environ.get(DISABLE_OPS_ENV, "")
-    if op in (name.strip() for name in disabled_ops.split(",")):
+    return (
+        os.environ.get(DISABLE_ENV, "0") == "1",
+        frozenset(name.strip() for name in disabled_ops.split(",") if name.strip()),
+    )
+
+
+def is_aiter_enabled(op: str) -> bool:
+    """True when aiter may serve ``op``: available and not switched off."""
+    all_off, ops_off = _switches()
+    if all_off or op in ops_off:
         return False
     return is_aiter_available()
+
+
+def reset() -> None:
+    """Read the environment and check the installed aiter again on next use.
+    For tests that change the environment variables."""
+    _switches.cache_clear()
+    is_aiter_available.cache_clear()
 
 
 @functools.lru_cache(maxsize=None)

@@ -24,8 +24,8 @@ PINNED: str = common.pinned_version()
 
 class AiterCommonTest(unittest.TestCase):
     def setUp(self) -> None:
-        common.is_aiter_available.cache_clear()
-        self.addCleanup(common.is_aiter_available.cache_clear)
+        common.reset()
+        self.addCleanup(common.reset)
         env = {
             k: v
             for k, v in os.environ.items()
@@ -79,15 +79,24 @@ class AiterCommonTest(unittest.TestCase):
         with self.assertLogs(common.logger, level="WARNING"):
             self.assertTrue(self._available("0.1.1.dev1+g0000000.noprebuild"))
 
+    def _enabled(self, op: str, **env: str) -> bool:
+        with mock.patch.dict(os.environ, env):
+            common.reset()
+            with mock.patch.object(common, "is_aiter_available", return_value=True):
+                return common.is_aiter_enabled(op)
+
     def test_switches(self) -> None:
-        with mock.patch.object(common, "is_aiter_available", return_value=True):
-            self.assertTrue(common.is_aiter_enabled("f4f4bf16"))
-            os.environ[common.DISABLE_OPS_ENV] = "other_op, f4f4bf16"
-            self.assertFalse(common.is_aiter_enabled("f4f4bf16"))
-            self.assertTrue(common.is_aiter_enabled("other_op_2"))
-            del os.environ[common.DISABLE_OPS_ENV]
-            os.environ[common.DISABLE_ENV] = "1"
-            self.assertFalse(common.is_aiter_enabled("f4f4bf16"))
+        self.assertTrue(self._enabled("f4f4bf16"))
+        off = {common.DISABLE_OPS_ENV: "other_op, f4f4bf16"}
+        self.assertFalse(self._enabled("f4f4bf16", **off))
+        self.assertTrue(self._enabled("other_op_2", **off))
+        self.assertFalse(self._enabled("f4f4bf16", **{common.DISABLE_ENV: "1"}))
+
+    def test_switches_are_read_once(self) -> None:
+        self.assertTrue(self._enabled("f4f4bf16"))
+        with mock.patch.dict(os.environ, {common.DISABLE_ENV: "1"}):
+            with mock.patch.object(common, "is_aiter_available", return_value=True):
+                self.assertTrue(common.is_aiter_enabled("f4f4bf16"))
 
     def test_switches_cannot_enable_an_unavailable_aiter(self) -> None:
         with mock.patch.object(common, "is_aiter_available", return_value=False):
