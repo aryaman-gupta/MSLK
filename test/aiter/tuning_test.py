@@ -21,6 +21,7 @@ import torch
 from mslk.aiter.routing import MSLK
 from mslk.aiter.tuning import (
     _error_stats,
+    bucket_lower_edges,
     choose,
     Measurement,
     merge_rows,
@@ -152,6 +153,18 @@ class ErrorStatsTest(unittest.TestCase):
         out = torch.tensor([1.0, float("nan"), float("inf"), 1.005])
         err_ratio, _ = _error_stats(_Tuner(), out, ref)
         self.assertEqual(err_ratio, 0.5)
+
+
+class BucketEdgeTest(unittest.TestCase):
+    def test_lower_edge_is_one_past_the_previous_bucket_for_the_same_key(self) -> None:
+        untuned = [
+            {"N": "8", "K": "512", "M_max": m} for m in ("64", "1", "16", "16")
+        ] + [{"N": "9", "K": "512", "M_max": "64"}]
+        edges = bucket_lower_edges(untuned, _Tuner())
+        self.assertEqual(edges[("8", "512", "1")], 1)
+        self.assertEqual(edges[("8", "512", "16")], 2)
+        self.assertEqual(edges[("8", "512", "64")], 17)
+        self.assertEqual(edges[("9", "512", "64")], 1)
 
 
 class RotationTest(unittest.TestCase):

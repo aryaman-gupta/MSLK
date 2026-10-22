@@ -43,8 +43,9 @@ tuners (``aiter/utility/base_tuner.py``):
   that does not fit the GPU), is left out for that shape. MSLK's own kernel
   failing the check is a bug to fix, not a shape to route around: that row is
   not written, and the run exits with an error listing such shapes.
-- **Buckets** are measured at their bound: M_max=128 is measured at M=128
-  (and serves 64 < M <= 128, see :mod:`mslk.aiter.routing`).
+- **Buckets** are timed at their bound (M_max=128 at M=128; it serves
+  64 < M <= 128, see :mod:`mslk.aiter.routing`), and checked for correctness
+  at both of their ends.
 - **Profile.** ``-o2`` appends every candidate's measurement, including errors,
   to a CSV.
 
@@ -254,6 +255,23 @@ def shapes_to_tune(
     return todo
 
 
+def bucket_lower_edges(
+    untuned: Sequence[Row], tuner: OpTuner
+) -> Dict[Tuple[str, ...], int]:
+    """For each untuned shape (its key columns and bucket), the smallest bucket
+    value it serves: one more than the previous bucket for the same key, or 1."""
+    bounds: Dict[Tuple[str, ...], List[int]] = {}
+    for shape in untuned:
+        key = tuple(shape[c] for c in tuner.key_columns)
+        bounds.setdefault(key, []).append(int(shape[tuner.bucket_column]))
+    edges = {}
+    for key, values in bounds.items():
+        values = sorted(set(values))
+        for i, value in enumerate(values):
+            edges[key + (str(value),)] = values[i - 1] + 1 if i else 1
+    return edges
+
+
 def table_row(tuner: OpTuner, result: ShapeResult) -> Row:
     by_backend = {m.backend: m for m in result.measurements}
     chosen = by_backend[result.backend]
@@ -358,10 +376,23 @@ def _error_stats(
     return outside.float().mean().item(), err.max().item()
 
 
+def _check(
+    tuner: OpTuner, inputs: Dict[str, Any], ref: torch.Tensor
+) -> Tuple[float, float]:
+    for name in tuner.outputs:
+        inputs[name].fill_(float("nan"))
+    return _error_stats(tuner, tuner.run(inputs), ref)
+
+
 def tune_shape(
-    tuner: OpTuner, shape: Row, settings: Settings, order_flip: bool
+    tuner: OpTuner,
+    shape: Row,
+    settings: Settings,
+    order_flip: bool,
+    lower_edge: Optional[int] = None,
 ) -> ShapeResult:
-    """Check and time every backend on one shape, on the current GPU."""
+    """Check and time every backend on one shape, on the current GPU; with
+    ``lower_edge``, also check correctness at that bucket value."""
     gfx, cu_num = device_key(torch.cuda.current_device())
     device = {"gfx": gfx, "cu_num": str(cu_num)}
     # Seeded by the shape, so a shape's data does not depend on which worker
@@ -373,14 +404,19 @@ def tune_shape(
     copies = [inputs] + [
         {k: _clone(v) for k, v in inputs.items()} for _ in range(n_copies - 1)
     ]
+    checks = [(inputs, ref)]
+    if lower_edge is not None and lower_edge != int(shape[tuner.bucket_column]):
+        lower = {**shape, tuner.bucket_column: str(lower_edge)}
+        lower_inputs = tuner.make_inputs(lower)
+        checks.append((lower_inputs, tuner.reference(lower, lower_inputs)))
     measurements = []
     order = tuner.backends[::-1] if order_flip else tuner.backends
     for backend in order:
         with force_backend(tuner.op, backend):
             try:
-                for name in tuner.outputs:
-                    inputs[name].fill_(float("nan"))
-                err_ratio, max_err = _error_stats(tuner, tuner.run(inputs), ref)
+                errors = [_check(tuner, i, r) for i, r in checks]
+                err_ratio = max(e[0] for e in errors)
+                max_err = max(e[1] for e in errors)
                 correct = err_ratio == 0.0
                 us = time_us(tuner, copies, settings.warmup, settings.iters)
                 measurements.append(
@@ -482,9 +518,15 @@ def main(tuner: OpTuner, untune_file: str, tune_file: str) -> None:
     device = {"gfx": gfx, "cu_num": str(cu_num)}
 
     table = read_csv_rows(args.tune_file)
-    todo = shapes_to_tune(
-        read_csv_rows(args.untune_file), table, device, tuner, args.all
-    )
+    untuned = read_csv_rows(args.untune_file)
+    todo = shapes_to_tune(untuned, table, device, tuner, args.all)
+    edges = bucket_lower_edges(untuned, tuner)
+
+    def lower_edge(shape: Row) -> int:
+        return edges[
+            tuple(shape[c] for c in tuner.key_columns + (tuner.bucket_column,))
+        ]
+
     print(f"{len(todo)} shapes to tune on {gfx} ({cu_num} CUs), {args.mp} GPU(s)")
     if not todo:
         return
@@ -524,7 +566,9 @@ def main(tuner: OpTuner, untune_file: str, tune_file: str) -> None:
     try:
         if args.mp <= 1:
             for i, shape in enumerate(todo):
-                collect(tune_shape(tuner, shape, settings, i % 2 == 1))
+                collect(
+                    tune_shape(tuner, shape, settings, i % 2 == 1, lower_edge(shape))
+                )
         else:
             ctx = mp.get_context("spawn")
             gpus = ctx.Queue()
@@ -539,7 +583,14 @@ def main(tuner: OpTuner, untune_file: str, tune_file: str) -> None:
             )
             try:
                 futures = [
-                    pool.submit(tune_shape, tuner, shape, settings, i % 2 == 1)
+                    pool.submit(
+                        tune_shape,
+                        tuner,
+                        shape,
+                        settings,
+                        i % 2 == 1,
+                        lower_edge(shape),
+                    )
                     for i, shape in enumerate(todo)
                 ]
                 for future in as_completed(futures):
