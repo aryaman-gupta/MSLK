@@ -32,7 +32,7 @@ from mslk.quantize.triton.fp4_quantize import (
     triton_quantize_mx4_unpack,
     triton_quantize_nvfp4,
 )
-from mslk.quantize.triton.fp4_utils import global_scale_nvfp4
+from mslk.quantize.triton.fp4_utils import dequantize_mx4_unswizzled, global_scale_nvfp4
 from mslk.testing.device import (
     skipUnlessCuda,
     skipUnlessCudaCapability,
@@ -3261,8 +3261,15 @@ class MXFP4Tests(unittest.TestCase):
         ]
     )
     def test_gemm(self, M: int, N: int, K: int, backend: str) -> None:
-        A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
-        B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        # On ROCm the reference is the product of the dequantized inputs, which
+        # the kernels match up to summation order and BF16 rounding, so the
+        # tolerance is tight; unit-scale inputs keep outputs far above atol at
+        # every K, so a wrong or partial result fails.
+        rocm = torch.version.hip is not None
+        A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
+        B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device)
+        if not rocm:
+            A, B = A * 0.1, B * 0.01
 
         aq, a_scale = triton_quantize_mx4_unpack(A)
         bq, b_scale = triton_quantize_mx4_unpack(B)
@@ -3273,9 +3280,14 @@ class MXFP4Tests(unittest.TestCase):
             else contextlib.nullcontext()
         ):
             out_mxfp4 = torch.ops.mslk.f4f4bf16(aq, bq, a_scale, b_scale)
-        out_bf16 = A @ B.t()
 
-        torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
+        if rocm:
+            ref = dequantize_mx4_unswizzled(aq, a_scale) @ (
+                dequantize_mx4_unswizzled(bq, b_scale).T
+            )
+            torch.testing.assert_close(out_mxfp4.float(), ref, atol=1e-2, rtol=1e-2)
+        else:
+            torch.testing.assert_close(out_mxfp4, A @ B.t(), atol=8.0e-2, rtol=8.0e-2)
         if (
             backend == "default"
             and (M, N, K) in _F4F4BF16_AITER_SHAPES

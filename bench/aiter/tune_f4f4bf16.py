@@ -33,22 +33,9 @@ from mslk.aiter import tuning
 from mslk.aiter.tuning import OpTuner, Row
 from mslk.gemm.dispatch.f4f4bf16 import BACKENDS, OP
 from mslk.quantize.triton.fp4_quantize import triton_quantize_mx4_unpack
+from mslk.quantize.triton.fp4_utils import dequantize_mx4_unswizzled
 
 REPO = Path(__file__).resolve().parents[2]
-
-# E2M1 values by 4-bit code; codes 8-15 are the negatives of 0-7.
-_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-_E2M1 = _E2M1 + tuple(-v for v in _E2M1)
-
-
-def dequantize(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Packed MXFP4 (low nibble first) and E8M0 scales -> float32."""
-    q = q.view(torch.uint8)
-    lut = torch.tensor(_E2M1, device=q.device)
-    values = torch.stack([lut[(q & 0xF).long()], lut[(q >> 4).long()]], dim=-1)
-    values = values.flatten(-2)
-    scale = torch.exp2(scale.view(torch.uint8).float() - 127.0)
-    return values * scale.repeat_interleave(32, dim=-1)
 
 
 class F4F4BF16Tuner(OpTuner):
@@ -78,8 +65,8 @@ class F4F4BF16Tuner(OpTuner):
         )
 
     def reference(self, shape: Row, inputs: Dict[str, Any]) -> torch.Tensor:
-        a = dequantize(inputs["aq"], inputs["a_scale"])
-        b = dequantize(inputs["bq"], inputs["b_scale"])
+        a = dequantize_mx4_unswizzled(inputs["aq"], inputs["a_scale"])
+        b = dequantize_mx4_unswizzled(inputs["bq"], inputs["b_scale"])
         return a @ b.T
 
     def flops(self, shape: Row) -> float:
