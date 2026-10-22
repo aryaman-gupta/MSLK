@@ -23,7 +23,7 @@ from mslk.flydsl.common import (
     is_flydsl_version_at_least,
     MIN_FLYDSL_VERSION,
 )
-from mslk.gemm.dispatch.f4f4bf16 import OP as F4F4BF16_OP
+from mslk.gemm.dispatch.f4f4bf16 import OP as F4F4BF16_OP, ROUTING as F4F4BF16_ROUTING
 from mslk.quantize.triton.fp4_quantize import (
     _to_blocked,
     calculate_group_max,
@@ -3224,6 +3224,14 @@ class NVFP4Tests(unittest.TestCase):
         self.assertEqual(out.device.type, "meta")
 
 
+# Shapes that f4f4bf16's tuning table routes to aiter on gfx950, so that the
+# op's tests cover aiter's kernel as well as MSLK's.
+_F4F4BF16_AITER_SHAPES: tuple[tuple[int, int, int], ...] = (
+    (1, 7168, 2048),
+    (33, 3072, 1536),
+)
+
+
 @skipUnlessGfxArch("gfx950")
 @skipUnlessCudaCapability(10)
 class MXFP4Tests(unittest.TestCase):
@@ -3243,18 +3251,16 @@ class MXFP4Tests(unittest.TestCase):
                 # must be masked rather than read past the end of each row.
                 (33, 160, 192),
                 (100, 1024, 2080),
+                *_F4F4BF16_AITER_SHAPES,
+                (1000, 7168, 2048),  # in the tuning table, routed to MSLK
             )
-            # On ROCm the op routes each shape to MSLK's kernel or aiter's by
-            # its tuning table ("default"); forcing each backend runs both
-            # kernels on every shape.
-            for backend in ("default", "mslk", "aiter")
+            # "default" uses the op's routing on ROCm, which sends the shapes in
+            # its tuning table to aiter or MSLK's kernel; "mslk" forces MSLK's
+            # kernel, the fallback, on every shape.
+            for backend in ("default", "mslk")
         ]
     )
     def test_gemm(self, M: int, N: int, K: int, backend: str) -> None:
-        if backend == "aiter" and not (
-            torch.version.hip is not None and is_aiter_available()
-        ):
-            self.skipTest("requires ROCm and the pinned aiter")
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
@@ -3270,6 +3276,18 @@ class MXFP4Tests(unittest.TestCase):
         out_bf16 = A @ B.t()
 
         torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
+        if (
+            backend == "default"
+            and (M, N, K) in _F4F4BF16_AITER_SHAPES
+            and torch.version.hip is not None
+            and is_aiter_available()
+        ):
+            self.assertEqual(
+                F4F4BF16_ROUTING.backend_for(aq, bq, a_scale, b_scale),
+                "aiter",
+                "the tuning table no longer routes this shape to aiter; replace "
+                "it in _F4F4BF16_AITER_SHAPES with one it does",
+            )
 
     @parameterized.expand(
         [
