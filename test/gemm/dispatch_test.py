@@ -9,14 +9,8 @@
 """Each routed GEMM op serves its calls with the backend its tuning table names.
 
 End to end, on the GPU: for each op, the cheapest row of its table per backend
-is called through the registered op, with real inputs, and the test checks
-which backend served it. This covers the op's registration, its dispatch module
-(mslk/gemm/dispatch/) and its table key. How choosing works is tested once, in
-test/aiter/routing_test.py, and what each backend computes by each op's own
-tests.
-
-Adding a routed op means adding one entry to ``CASES``: its routing, the op,
-and a function building the op's arguments for a table row.
+is called through the registered op, and the test checks which backend served
+it. Adding a routed op means adding one entry to ``CASES``.
 """
 
 import math

@@ -8,10 +8,6 @@
 
 """Importing MSLK, including its aiter backends, must not import aiter.
 
-aiter's first import compiles a module with hipcc, and importing it loads
-FlyDSL and Triton into the process. MSLK imports it only on the first call an
-aiter backend serves.
-
 This test owns its own target so that nothing else in the process can import
 aiter first and mask a regression.
 """

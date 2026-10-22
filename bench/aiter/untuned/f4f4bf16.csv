@@ -1,6 +1,5 @@
 # Shapes tuned for mslk::f4f4bf16; each row becomes one row of its tuning table.
-# M_max is the bucket's upper bound: measured at M=M_max, it serves calls with
-# M above the previous M_max for the same (N, K) and up to M_max.
+# M_max is the M bucket's bound (see mslk/aiter/routing.py).
 # Initial list: the (N, K) shapes aiter ships tuned gemm_afp4wfp4 configs for on
 # gfx950, which include all Llama 3 405B projections (unsharded and 8-way
 # tensor-parallel) and some of Llama 3 70B's, each at M = 1, 2, 4, ..., 16384.

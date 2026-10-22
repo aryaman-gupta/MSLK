@@ -10,7 +10,7 @@
 
 An op's tuning script subclasses :class:`OpTuner` and supplies only what is
 specific to the op: its table's key columns, how to build inputs for a shape,
-how to call the op, and the reference its unit test compares against. This
+how to call the op, and its reference and tolerance. This
 module does the rest, the same way for every op, modelled on aiter's own
 tuners (``aiter/utility/base_tuner.py``):
 
@@ -43,9 +43,8 @@ tuners (``aiter/utility/base_tuner.py``):
   that does not fit the GPU), is left out for that shape. MSLK's own kernel
   failing the check is a bug to fix, not a shape to route around: that row is
   not written, and the run exits with an error listing such shapes.
-- **Buckets.** A row's bucket value (e.g. ``M_max``) is both what is measured
-  and the upper bound of the calls it serves (see :mod:`mslk.aiter.routing`):
-  M_max=128 is measured at M=128 and serves 64 < M <= 128.
+- **Buckets** are measured at their bound: M_max=128 is measured at M=128
+  (and serves 64 < M <= 128, see :mod:`mslk.aiter.routing`).
 - **Profile.** ``-o2`` appends every candidate's measurement, including errors,
   to a CSV.
 
@@ -118,9 +117,8 @@ class OpTuner(abc.ABC):
     #: Tolerances of the correctness check.
     atol: float
     rtol: float
-    #: Keys of :meth:`make_inputs` that the op writes, e.g. an output buffer.
-    #: They are filled with NaN before each backend's check, so that results a
-    #: backend failed to write are not taken from another backend's run.
+    #: Keys of :meth:`make_inputs` the op writes; filled with NaN before each
+    #: backend's check.
     outputs: Tuple[str, ...] = ()
 
     @abc.abstractmethod

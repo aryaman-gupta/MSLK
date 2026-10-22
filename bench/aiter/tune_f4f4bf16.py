@@ -14,14 +14,10 @@ Compares MSLK's Triton kernel with aiter's ``gemm_afp4wfp4`` on every shape in
 multi-GPU, timing, choosing) is :mod:`mslk.aiter.tuning`; this file holds only
 what is specific to the op. Needs the pinned aiter and a gfx950 GPU.
 
-Correctness: the reference is the product of the dequantized inputs, i.e.
-exactly what the kernels compute up to FP32 summation order and the BF16
-rounding of the output, so quantization error plays no part. The tolerance is
-therefore tight: rtol = atol = 1e-2, aiter's default, about 2.5x BF16's
-rounding error. Inputs are unit-scale, so the outputs (standard deviation about
-sqrt(K)) are far larger than atol at every K, and a wrong or partial result
-cannot pass. (The unit test's tolerance, 8e-2 on inputs scaled by 0.1 and
-0.01, absorbs quantization error and is wider than the outputs at small K.)
+Correctness: the reference is the product of the dequantized inputs, which
+the kernels match up to summation order and BF16 rounding, so the tolerance is
+tight (rtol = atol = 1e-2, aiter's default). Inputs are unit-scale, so outputs
+are far larger than atol at every K.
 
 Example, on four GPUs (run from the repository root):
 

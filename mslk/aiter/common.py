@@ -21,9 +21,7 @@ Within those limits, each op's tuning table decides which calls aiter serves.
 Environment variables
 ---------------------
 
-All are optional; set them to ``1`` (or, for ``MSLK_DISABLE_AITER_OPS``, a
-list) before the process makes its first op call that could use aiter. They are
-read once, on first use, and not again; tests that change them call
+All are optional, and read once, on first use; tests that change them call
 :func:`reset`.
 
 ``MSLK_DISABLE_AITER=1``
@@ -48,10 +46,8 @@ The switches can only turn aiter off: neither makes aiter serve a call its
 table does not give it. Tests and tuning scripts choose a backend with
 :func:`mslk.aiter.routing.force_backend` instead.
 
-Nothing here imports aiter: checking runs on package metadata, and aiter is
-imported on the first call that uses it. Importing aiter is expensive (its
-first import compiles a module with hipcc) and loads FlyDSL and Triton into the
-process, so it must never happen as a side effect of ``import mslk``.
+Nothing here imports aiter; it is imported on the first call that uses it,
+never by ``import mslk``.
 """
 
 import functools
@@ -95,12 +91,7 @@ def installed_version() -> Optional[str]:
 
 @functools.lru_cache(maxsize=1)
 def is_aiter_available() -> bool:
-    """True when MSLK may use the installed aiter at all.
-
-    Decided once per process. A different aiter than the pinned one is not
-    used, with one warning, since MSLK's tables and tests only vouch for the
-    pinned build.
-    """
+    """True when MSLK may use the installed aiter at all; decided once per process."""
     if torch.version.hip is None:
         return False
     installed = installed_version()
@@ -130,9 +121,7 @@ def is_aiter_available() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def _switches() -> Tuple[bool, FrozenSet[str]]:
-    """(all of aiter off, ops with aiter off), read from the environment once:
-    reading it on every call would add about 1 us of CPU time per eager op
-    call."""
+    """(all of aiter off, ops with aiter off), read from the environment once."""
     disabled_ops = os.environ.get(DISABLE_OPS_ENV, "")
     return (
         os.environ.get(DISABLE_ENV, "0") == "1",

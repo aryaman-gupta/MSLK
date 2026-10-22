@@ -13,9 +13,8 @@ values packed two per byte (low nibble first), one E8M0 scale per 32 elements
 of K, BF16 output. Its outputs are bitwise identical to MSLK's Triton kernel's,
 so the op's arguments go to it unchanged.
 
-``gemm_afp4wfp4`` also has a Gluon kernel for gfx950 (``backend="gluon"``).
-aiter does not use it by default there, and on plain (not preshuffled) weights
-it is one to two orders of magnitude slower, so it is not used.
+Its Gluon kernel (``backend="gluon"``) is not used: it is not aiter's default
+on gfx950, and is 10-100x slower there on plain weights.
 
 Which calls this backend serves is decided in ``mslk/gemm/dispatch/f4f4bf16.py``.
 """
