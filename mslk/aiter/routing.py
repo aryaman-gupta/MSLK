@@ -113,8 +113,7 @@ def force_backend(op: str, backend: str) -> Iterator[None]:
     the same shapes.
 
     Not thread-safe: the setting is process-wide, so it applies to calls from
-    every thread while active. (pytest-xdist workers are separate processes,
-    so they do not affect each other.)"""
+    every thread while active."""
     previous = _forced.get(op)
     _forced[op] = backend
     try:
