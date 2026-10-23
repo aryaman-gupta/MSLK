@@ -110,7 +110,11 @@ _forced: Dict[str, str] = {}
 def force_backend(op: str, backend: str) -> Iterator[None]:
     """Make ``op`` use ``backend`` for every shape, ignoring its table and
     switches. For tests and tuning scripts, which need to run each backend on
-    the same shapes."""
+    the same shapes.
+
+    Not thread-safe: the setting is process-wide, so it applies to calls from
+    every thread while active. (pytest-xdist workers are separate processes,
+    so they do not affect each other.)"""
     previous = _forced.get(op)
     _forced[op] = backend
     try:
