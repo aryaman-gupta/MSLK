@@ -11,6 +11,7 @@ from typing import Callable, Dict, Tuple, Union
 import torch
 import triton
 import triton.language as tl
+from mslk.utils.device import is_gfx950, rocm_version_at_least
 
 from .vararg_kernel import unroll_varargs, VAR_ARGS_ARRAY
 
@@ -121,6 +122,7 @@ def _fwd_kernel_splitK(  # noqa: C901
     HAS_ADDITIVE_BIAS: tl.constexpr,
     NUM_PROGRAMS_DIM2_CONST: tl.constexpr,
     IS_HIP: tl.constexpr,
+    FP8_FNUZ: tl.constexpr,
     QUANTIZE_PV_TO_FP8: tl.constexpr,
     QUANTIZE_QK_TO_FP8: tl.constexpr,
     USE_FP32_SCALES: tl.constexpr,
@@ -534,9 +536,12 @@ def _fwd_kernel_splitK(  # noqa: C901
                 PACKED_D_PER_GROUP,
                 FP8_QUANTIZED,
                 Q.dtype.element_ty,
+                # pyrefly: ignore [bad-argument-type]
                 v_dtype,
+                # pyrefly: ignore [bad-argument-type]
                 i,
                 IS_HIP,
+                FP8_FNUZ,
                 QUANTIZE_PV_TO_FP8,
                 QUANTIZE_QK_TO_FP8,
                 USE_FP32_SCALES,
@@ -544,16 +549,16 @@ def _fwd_kernel_splitK(  # noqa: C901
 
             # Unpack results based on quantization configuration
             if QUANTIZE_PV_TO_FP8 and QUANTIZE_QK_TO_FP8:
-                # pyrefly: ignore [unbound-name]
+                # pyrefly: ignore [bad-unpacking, unbound-name]
                 k[i], v[i], v_scale, k_scale = result  # noqa: F821
             elif QUANTIZE_PV_TO_FP8:
-                # pyrefly: ignore [unbound-name]
+                # pyrefly: ignore [bad-unpacking, unbound-name]
                 k[i], v[i], v_scale = result  # noqa: F821
             elif QUANTIZE_QK_TO_FP8:
-                # pyrefly: ignore [unbound-name]
+                # pyrefly: ignore [bad-unpacking, unbound-name]
                 k[i], v[i], k_scale = result  # noqa: F821
             else:
-                # pyrefly: ignore [unbound-name]
+                # pyrefly: ignore [bad-unpacking, unbound-name]
                 k[i], v[i] = result  # noqa: F821
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -778,10 +783,16 @@ def autotune_kernel(kernel: Callable):
         if block_n >= block_m
     ]
 
+    # HIP graph capture faulted (HSA_INVALID_PACKET / GPU faults) during autotuning of
+    # this kernel on gfx950 with ROCm < 7.14; fixed in ROCm 7.14. Disable graph-based
+    # autotuning only on that affected stack; gfx942, CUDA, and gfx950 on ROCm >= 7.14
+    # keep it.
+    graph_autotune_broken = is_gfx950() and not rocm_version_at_least(7, 14)
+
     kernel = triton.autotune(
         configs=TRITON_CONFIGS,
         key=AUTOTUNER_KEY,
-        use_cuda_graph=True,
+        use_cuda_graph=not graph_autotune_broken,
         prune_configs_by={
             "early_config_prune": early_config_prune,
         },
@@ -799,6 +810,7 @@ _fwd_kernel_splitK_autotune: Dict[int, triton.runtime.Autotuner] = {}
 if sys.version_info >= (3, 9):
     # unroll_varargs requires Python 3.9+
     for num_groups in [1, 2, 4, 8]:
+        # pyrefly: ignore [unsupported-operation]
         _fwd_kernel_splitK_autotune[num_groups] = autotune_kernel(
             _get_splitk_kernel(num_groups)
         )
@@ -832,6 +844,7 @@ def load_dequantize_k_v_group(
     v_dtype: tl.constexpr,  # Q.dtype.element_ty
     group_id: tl.constexpr,
     IS_HIP: tl.constexpr,
+    FP8_FNUZ: tl.constexpr,
     QUANTIZE_PV_TO_FP8: tl.constexpr,
     QUANTIZE_QK_TO_FP8: tl.constexpr,
     USE_FP32_SCALES: tl.constexpr,
@@ -872,6 +885,7 @@ def load_dequantize_k_v_group(
             q_dtype,
             v_dtype,
             IS_HIP,
+            FP8_FNUZ,
             QUANTIZE_PV_TO_FP8,
             QUANTIZE_QK_TO_FP8,
             USE_FP32_SCALES,
@@ -919,6 +933,7 @@ def _process_fp8_quantization(
     q_dtype: tl.constexpr,
     v_dtype: tl.constexpr,
     IS_HIP: tl.constexpr,
+    FP8_FNUZ: tl.constexpr,
     QUANTIZE_PV_TO_FP8: tl.constexpr,
     QUANTIZE_QK_TO_FP8: tl.constexpr,
     USE_FP32_SCALES: tl.constexpr,
@@ -936,6 +951,7 @@ def _process_fp8_quantization(
             v_shift if not USE_FP32_SCALES else None,
             PACKED_PER_VAL,
             IS_HIP,
+            FP8_FNUZ,
             USE_FP32_SCALES,
         ).to(v_dtype)
     else:
@@ -949,7 +965,9 @@ def _process_fp8_quantization(
     k_scale, k_shift = _extract_scale_shift(k_scale_shift, IS_HIP, USE_FP32_SCALES)
     if IS_HIP:
         if not QUANTIZE_QK_TO_FP8:
-            k = dequantize_k_hip(k, k_scale, k_shift, PACKED_PER_VAL).to(q_dtype)
+            k = dequantize_k_hip(k, k_scale, k_shift, PACKED_PER_VAL, FP8_FNUZ).to(
+                q_dtype
+            )
         else:
             # For QUANTIZE_QK_TO_FP8, unpack int32 to 8-bit entries and interpret as fp8
             tl.static_assert(PACKED_PER_VAL == 4, "Assert: int32 packs four FP8 values")
@@ -958,9 +976,11 @@ def _process_fp8_quantization(
             k_t = dequantize(
                 tl.trans(k),
                 tl.trans(k_scale),
+                # pyrefly: ignore [bad-argument-type]
                 tl.trans(k_shift) if not USE_FP32_SCALES else None,
                 PACKED_PER_VAL,
                 IS_HIP,
+                FP8_FNUZ,
                 USE_FP32_SCALES,
             ).to(q_dtype)
             k = tl.trans(k_t)
@@ -968,7 +988,7 @@ def _process_fp8_quantization(
             # For QUANTIZE_QK_TO_FP8, unpack int32 to 8-bit entries and interpret as fp8
             tl.static_assert(PACKED_PER_VAL == 4, "Assert: int32 packs four FP8 values")
             k_t = tl.trans(k)
-            k_t = _unpack_fp8_tensor(k_t, PACKED_PER_VAL, IS_HIP)
+            k_t = _unpack_fp8_tensor(k_t, PACKED_PER_VAL, IS_HIP, FP8_FNUZ)
             k = tl.trans(k_t)
 
     return k, v, v_scale, k_scale
@@ -988,7 +1008,9 @@ def _extract_scale_shift(
 
 
 @triton.jit
-def _unpack_fp8_tensor(x_, PACKED_PER_VAL: tl.constexpr, IS_HIP: tl.constexpr):
+def _unpack_fp8_tensor(
+    x_, PACKED_PER_VAL: tl.constexpr, IS_HIP: tl.constexpr, FP8_FNUZ: tl.constexpr
+):
     """Unpack FP8 K/V tensor from int32 packed representation."""
     tl.static_assert(PACKED_PER_VAL == 4, "Assert: int32 packs four FP8 values")
 
@@ -1003,8 +1025,9 @@ def _unpack_fp8_tensor(x_, PACKED_PER_VAL: tl.constexpr, IS_HIP: tl.constexpr):
         unpacked_values, (BLOCK_N, BLOCK_DMODEL_PACKED * PACKED_PER_VAL)
     )
 
-    # Convert to FP8 through bitcast
-    fp8_type = tl.float8e4b8 if IS_HIP else tl.float8e4nv
+    # Convert to FP8 through bitcast. gfx942 uses e4m3fnuz (float8e4b8); gfx950 and
+    # CUDA use OCP e4m3fn (float8e4nv). FP8_FNUZ carries the arch decision.
+    fp8_type = tl.float8e4b8 if FP8_FNUZ else tl.float8e4nv
     x_ = unpacked_values.to(tl.uint8).to(fp8_type, bitcast=True)
 
     return x_
@@ -1036,18 +1059,20 @@ def _process_int4_quantization(
     if IS_HIP:
         k_scale, k_shift = cast_uint32_to_float(k_scale_shift)
         v_scale, v_shift = cast_uint32_to_float(v_scale_shift)
-        v = dequantize(v, v_scale, v_shift, PACKED_PER_VAL, IS_HIP).to(dtype)
-        k = dequantize_k_hip(k, k_scale, k_shift, PACKED_PER_VAL).to(dtype)
+        # int4 path never reaches the fp8 branch inside dequantize; FP8_FNUZ is unused.
+        v = dequantize(v, v_scale, v_shift, PACKED_PER_VAL, IS_HIP, False).to(dtype)
+        k = dequantize_k_hip(k, k_scale, k_shift, PACKED_PER_VAL, False).to(dtype)
     else:
         k_scale, k_shift = cast_uint32_to_half2(k_scale_shift)
         v_scale, v_shift = cast_uint32_to_half2(v_scale_shift)
-        v = dequantize(v, v_scale, v_shift, PACKED_PER_VAL, IS_HIP).to(dtype)
+        v = dequantize(v, v_scale, v_shift, PACKED_PER_VAL, IS_HIP, False).to(dtype)
         k_t = dequantize(
             tl.trans(k),
             tl.trans(k_scale),
             tl.trans(k_shift),
             PACKED_PER_VAL,
             IS_HIP,
+            False,
         ).to(dtype)
         k = tl.trans(k_t)
 
@@ -1088,6 +1113,7 @@ def dequantize_k_hip(
     scale,
     shift,
     PACKED_PER_VAL: tl.constexpr,
+    FP8_FNUZ: tl.constexpr,
 ):
     """PACKED_PER_VAL is the number of values packed into each element x_.
     For example, for int4 quantization and x_ of type int32, PACKED_PER_VAL is 8.
@@ -1107,8 +1133,8 @@ def dequantize_k_hip(
     )
 
     if PACKED_PER_VAL == 4:
-        # FP8 quantization.
-        fp8_type = tl.float8e4b8 if torch.version.hip is not None else tl.float8e4nv
+        # FP8 quantization. gfx942 -> e4m3fnuz (float8e4b8); gfx950/CUDA -> e4m3fn.
+        fp8_type = tl.float8e4b8 if FP8_FNUZ else tl.float8e4nv
         dequant = (
             quant_offset.to(tl.uint8).to(fp8_type, bitcast=True).to(scale.dtype) * scale
             + shift
@@ -1137,6 +1163,7 @@ def dequantize(
     shift,
     PACKED_PER_VAL: tl.constexpr,
     IS_HIP: tl.constexpr,
+    FP8_FNUZ: tl.constexpr,
     # pyrefly: ignore [bad-function-definition]
     USE_FP32_SCALES: tl.constexpr = False,
 ):
@@ -1157,8 +1184,8 @@ def dequantize(
         quant_offset, (BLOCK_N, BLOCK_DMODEL_PACKED * PACKED_PER_VAL)
     )
     if PACKED_PER_VAL == 4:
-        # FP8 quantization.
-        fp8_type = tl.float8e4b8 if torch.version.hip is not None else tl.float8e4nv
+        # FP8 quantization. gfx942 -> e4m3fnuz (float8e4b8); gfx950/CUDA -> e4m3fn.
+        fp8_type = tl.float8e4b8 if FP8_FNUZ else tl.float8e4nv
         dequant = (
             quant_offset.to(tl.uint8).to(fp8_type, bitcast=True).to(scale.dtype) * scale
         )

@@ -7,6 +7,7 @@
 import itertools
 import os
 import sys
+from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -22,11 +23,17 @@ import triton  # @manual=//triton:triton
 from mslk.bench.common.telemetry import export_benchmark_to_scuba, is_scuba_available
 from mslk.bench.common.utils import BenchOptions, common_bench_options, profiler
 from mslk.bench.gemm.gemm_ops import ComputeDtype, GemmOpBase, GemmType, get_gemm_ops
+from mslk.bench.roofline.capture import EmpiricalRoofline, load_empirical_roofline
+from mslk.bench.roofline.regime import CeilingType, classify_regime
+from mslk.bench.roofline.targets import load_target_matrix, lookup_target, TargetMatrix
+from mslk.utils.device import get_gfx_arch_name
 from tabulate import tabulate
 
 
 # Compute theoretical roofline values in TFLOPS for GPU and dtype combinations.
+# Keyed by device name (torch.cuda.get_device_name()) or GPU arch (gcnArchName).
 COMPUTE_ROOFLINE_TFLOPS: dict[str, dict[ComputeDtype, float]] = {
+    # NVIDIA
     "NVIDIA H100": {
         ComputeDtype.FP8: 1979.0,
         ComputeDtype.BF16: 989.0,
@@ -47,14 +54,83 @@ COMPUTE_ROOFLINE_TFLOPS: dict[str, dict[ComputeDtype, float]] = {
         ComputeDtype.TF32: 1250.0,
         ComputeDtype.FP32: 80.0,  # non-tensorcore
     },
+    # AMD MI300X (gfx942, CDNA3, 304 CUs @ 2100 MHz, 750W)
+    # Source: AMD Instinct MI300X data sheet
+    "gfx942": {
+        ComputeDtype.FP8: 2614.9,
+        ComputeDtype.BF16: 1307.4,
+        ComputeDtype.TF32: 653.7,
+        ComputeDtype.FP32: 163.4,
+    },
+    # AMD MI350X (gfx950, CDNA4, 256 CUs @ 2200 MHz, 1000W)
+    # Source: AMD Instinct MI350X data sheet
+    "gfx950": {
+        ComputeDtype.FP4: 9200.0,
+        ComputeDtype.FP8: 4600.0,
+        ComputeDtype.BF16: 2300.0,
+        ComputeDtype.FP32: 144.2,
+    },
 }
 
 
+_COMPUTE_DTYPE_TO_ROOFLINE_KEY: dict[ComputeDtype, str] = {
+    ComputeDtype.FP4: "fp4",
+    ComputeDtype.FP8: "fp8",
+    ComputeDtype.BF16: "bf16",
+    ComputeDtype.FP32: "fp32",
+}
+
+_empirical_roofline: EmpiricalRoofline | None = None
+_target_matrix: TargetMatrix | None = None
+_stat_iterations: int = 1
+_cov_bound: float = 3.0
+_cold_l2: bool = False
+
+
+def set_empirical_roofline(roofline: EmpiricalRoofline) -> None:
+    global _empirical_roofline
+    _empirical_roofline = roofline
+
+
+def set_target_matrix(matrix: TargetMatrix) -> None:
+    global _target_matrix
+    _target_matrix = matrix
+
+
+def set_bench_options(
+    stat_iterations: int = 1,
+    cov_bound: float = 3.0,
+    cold_l2: bool = False,
+) -> None:
+    global _stat_iterations, _cov_bound, _cold_l2
+    _stat_iterations = stat_iterations
+    _cov_bound = cov_bound
+    _cold_l2 = cold_l2
+
+
 def get_compute_roofline_tflops(compute_dtype: ComputeDtype) -> float | None:
+    if _empirical_roofline is not None:
+        dtype_key = _COMPUTE_DTYPE_TO_ROOFLINE_KEY.get(compute_dtype)
+        if dtype_key and dtype_key in _empirical_roofline.mfma_peak_tflops:
+            return _empirical_roofline.mfma_peak_tflops[dtype_key]
+    # Fall back to datasheet: try device name first (NVIDIA)
     gpu_rooflines = COMPUTE_ROOFLINE_TFLOPS.get(torch.cuda.get_device_name())
-    if gpu_rooflines is None:
-        return None
-    return gpu_rooflines.get(compute_dtype)
+    if gpu_rooflines is not None:
+        return gpu_rooflines.get(compute_dtype)
+    # Fall back to GPU arch (AMD — device name is generic "AMD Radeon Graphics")
+    gcn = get_gfx_arch_name()
+    if gcn:
+        arch = gcn.split(":")[0]
+        gpu_rooflines = COMPUTE_ROOFLINE_TFLOPS.get(arch)
+        if gpu_rooflines is not None:
+            return gpu_rooflines.get(compute_dtype)
+    return None
+
+
+def get_hbm_bw_gbps() -> float:
+    if _empirical_roofline is not None and _empirical_roofline.hbm_bw_gbps > 0:
+        return _empirical_roofline.hbm_bw_gbps
+    return triton.testing.get_dram_gbps()
 
 
 shape_registry = {}
@@ -221,6 +297,17 @@ class Metrics:
     extra_tags: dict[str, str] = field(default_factory=dict)
     extra_metrics: dict[str, float] = field(default_factory=dict)
 
+    # Roofline / regime fields
+    regime: str = ""
+    ceiling_type: str = ""
+    ceiling_value: float = 0.0
+    target_pct: float = 0.0
+    achieved_pct: float = 0.0
+    target_pass: Optional[bool] = None
+    cov_pct: float = 0.0
+    n_iterations: int = 0
+    median_ms: float = 0.0
+
     @staticmethod
     def header(shape_mode: ShapeMode = ShapeMode.REGULAR) -> str:
         is_grouped = shape_mode in (
@@ -239,7 +326,8 @@ class Metrics:
         header = (
             f"{'OpName':<30} {group_col} {shape_col:<25} "
             f"{'Sim':<10} {'SQNR(dB)':<10} {'Ms':<10} {'TFLOPS':<10} "
-            f"{'GB/s':<10} {'Mem BW Util %':<14} {'Compute Util %':<10}"
+            f"{'GB/s':<10} {'Mem BW Util %':<14} {'Compute Util %':<14} "
+            f"{'Regime':<6} {'Achieved%':<10} {'Target%':<8} {'Pass':<5} {'CoV%':<6}"
         )
         divider = "-" * len(header)
         return f"GEMM Bench\n{divider}\n{header}\n{divider}"
@@ -261,14 +349,25 @@ class Metrics:
 
         group_col = f"{self.groups:<6}" if is_grouped else ""
         compute_util_str = (
-            f"{self.compute_util:<10.2f}" if self.compute_util > 0 else "N/A"
+            f"{self.compute_util:<14.2f}" if self.compute_util > 0 else f"{'N/A':<14}"
         )
         sqnr_str = f"{self.sqnr:<10.2f}" if self.sqnr > 0 else f"{'N/A':<10}"
+        regime_str = f"{self.regime:<6}" if self.regime else f"{'':6}"
+        achieved_str = (
+            f"{self.achieved_pct:<10.2f}" if self.achieved_pct > 0 else f"{'':10}"
+        )
+        target_str = f"{self.target_pct:<8.1f}" if self.target_pct > 0 else f"{'':8}"
+        if self.target_pass is None:
+            pass_str = f"{'':5}"
+        else:
+            pass_str = f"{'PASS' if self.target_pass else 'FAIL':<5}"
+        cov_str = f"{self.cov_pct:<6.2f}" if self.cov_pct > 0 else f"{'':6}"
         return (
             f"{self.op:<30} {group_col} {shape:<25} "
             f"{self.sim:<10.3f} {sqnr_str} {self.ms:<10.3f} "
             f"{self.tflops:<10.2f} {self.gbps:<10.2f} "
-            f"{self.mem_bw_util:<14.2f} {compute_util_str}"
+            f"{self.mem_bw_util:<14.2f} {compute_util_str} "
+            f"{regime_str} {achieved_str} {target_str} {pass_str} {cov_str}"
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -283,10 +382,82 @@ class Metrics:
             f"{self.op}_gb/s": self.gbps,
             f"{self.op}_mem_bw_util": self.mem_bw_util,
             f"{self.op}_compute_util": self.compute_util,
+            f"{self.op}_regime": self.regime,
+            f"{self.op}_ceiling_type": self.ceiling_type,
+            f"{self.op}_ceiling_value": self.ceiling_value,
+            f"{self.op}_target_pct": self.target_pct,
+            f"{self.op}_achieved_pct": self.achieved_pct,
+            f"{self.op}_target_pass": self.target_pass,
+            f"{self.op}_cov_pct": self.cov_pct,
+            f"{self.op}_median_ms": self.median_ms,
         }
         if self.groups is not None:
             result["groups"] = self.groups
         return result
+
+
+def _enrich_metrics_with_regime(
+    metrics: Metrics,
+    m: int,
+    n: int,
+    k: int,
+    mem_bw_roofline_gbps: float,
+    compute_roofline_tflops: float | None,
+    is_grouped: bool = False,
+    num_groups: int | None = None,
+) -> None:
+    """Add regime, ceiling, achieved percentage, and target result to metrics."""
+    rc = classify_regime(m, n, k, is_grouped, num_groups)
+    metrics.regime = rc.regime.value
+    metrics.ceiling_type = rc.ceiling_type.value
+    metrics.target_pct = rc.target_low
+
+    target = None
+    if _target_matrix is not None:
+        target = lookup_target(_target_matrix, metrics.op, m, n, k)
+        if target is not None:
+            metrics.target_pct = target.target_pct
+
+    if rc.ceiling_type == CeilingType.MFMA_PEAK and compute_roofline_tflops:
+        metrics.ceiling_value = compute_roofline_tflops
+        metrics.achieved_pct = (
+            (metrics.tflops / compute_roofline_tflops) * 100
+            if compute_roofline_tflops > 0
+            else 0.0
+        )
+    elif rc.ceiling_type == CeilingType.HBM_BW:
+        metrics.ceiling_value = mem_bw_roofline_gbps
+        metrics.achieved_pct = (
+            (metrics.gbps / mem_bw_roofline_gbps) * 100
+            if mem_bw_roofline_gbps > 0
+            else 0.0
+        )
+    elif target is not None and target.ceiling_value:
+        metrics.ceiling_value = target.ceiling_value
+        metrics.achieved_pct = metrics.tflops / target.ceiling_value * 100
+
+    if metrics.achieved_pct > 0:
+        metrics.target_pass = metrics.achieved_pct >= metrics.target_pct
+
+
+def _get_bench_options(opts: BenchOptions) -> BenchOptions:
+    if not _cold_l2:
+        return opts
+    bench_opts = copy(opts)
+    bench_opts.rotating_buffer = True
+    return bench_opts
+
+
+def _record_statistics(metrics: Metrics, stat) -> float:
+    metrics.cov_pct = stat.cov_pct
+    metrics.median_ms = stat.median_ms
+    metrics.n_iterations = stat.n
+    if stat.cov_pct > _cov_bound:
+        print(
+            f"  WARNING: CoV {stat.cov_pct:.2f}% exceeds bound "
+            f"{_cov_bound}% for {metrics.op} ({metrics.M},{metrics.N},{metrics.K})"
+        )
+    return stat.median_ms
 
 
 def benchmark_grouped(
@@ -296,7 +467,6 @@ def benchmark_grouped(
     k: list[int],
     mem_bw_roofline_gbps: float,
     opts: BenchOptions,
-    bench_quantize: bool = False,
     shape_mode: ShapeMode = ShapeMode.GROUPED,
 ) -> list[Metrics]:
     num_groups = len(m)
@@ -375,52 +545,58 @@ def benchmark_grouped(
                 )
         if noise_power > 0:
             metrics.sqnr = float(10 * np.log10(signal_power / noise_power))
-        for _ in range(opts.num_iters):
-            # Now perform benchmark.
-            if bench_quantize:
-                # Benchmark both quantize and compute.
-                with profiler(enabled=opts.trace, with_stack=True):
-                    ms_runtime = gemm_op.benchmark(
-                        *preprocessed_args,
-                        opts=opts,
-                        bench_quantize=True,
-                    )
-            else:
-                with profiler(enabled=opts.trace, with_stack=True):
-                    ms_runtime = gemm_op.benchmark(
-                        *quantized_vals,
-                        opts=opts,
-                        bench_quantize=False,
-                    )
+        bench_opts = _get_bench_options(opts)
 
-            for i in range(num_groups):
-                output_multiplier = 2 if "fuse_scatter_add" in gemm_op.name else 1
-                if m[i] > 0:
-                    tflops = 2 * m[i] * n[i] * k[i] / (ms_runtime / 1e3) / 1e12
-                    gbps = (
-                        (
-                            quantized_vals[0][i].numel()
-                            * quantized_vals[0][i].element_size()
-                            + quantized_vals[1][i].numel()
-                            * quantized_vals[1][i].element_size()
-                            + output_multiplier
-                            * output[i].numel()
-                            * output[i].element_size()
-                        )
-                        / (ms_runtime / 1e3)
-                        / 1e9
+        # Now perform benchmark.
+        with profiler(enabled=opts.trace, with_stack=True):
+            if _stat_iterations > 1:
+                stat = gemm_op.benchmark_statistical(
+                    *quantized_vals,
+                    opts=bench_opts,
+                    n_iterations=_stat_iterations,
+                )
+                ms_runtime = _record_statistics(metrics, stat)
+            else:
+                ms_runtime = gemm_op.benchmark(*quantized_vals, opts=bench_opts)
+
+        for i in range(num_groups):
+            output_multiplier = 2 if "fuse_scatter_add" in gemm_op.name else 1
+            if m[i] > 0:
+                tflops = 2 * m[i] * n[i] * k[i] / (ms_runtime / 1e3) / 1e12
+                gbps = (
+                    (
+                        quantized_vals[0][i].numel()
+                        * quantized_vals[0][i].element_size()
+                        + quantized_vals[1][i].numel()
+                        * quantized_vals[1][i].element_size()
+                        + output_multiplier
+                        * output[i].numel()
+                        * output[i].element_size()
                     )
-                    metrics.gbps += gbps
-                    metrics.tflops += tflops
-                    metrics.mem_bw_util += (gbps / mem_bw_roofline_gbps) * 100
-                    if compute_roofline_tflops is not None:
-                        metrics.compute_util += (tflops / compute_roofline_tflops) * 100
-            metrics.ms += ms_runtime
-        metrics.ms /= opts.num_iters
-        metrics.tflops /= opts.num_iters
-        metrics.gbps /= opts.num_iters
-        metrics.mem_bw_util /= opts.num_iters
-        metrics.compute_util /= opts.num_iters
+                    / (ms_runtime / 1e3)
+                    / 1e9
+                )
+                metrics.gbps += gbps
+                metrics.tflops += tflops
+                metrics.mem_bw_util += (gbps / mem_bw_roofline_gbps) * 100
+                if compute_roofline_tflops is not None:
+                    metrics.compute_util += (tflops / compute_roofline_tflops) * 100
+        metrics.ms = ms_runtime
+
+        # Regime classification for grouped shapes (use first group's dimensions)
+        rep_m = m[0] if isinstance(m, list) else m
+        rep_n = n[0] if isinstance(n, list) else n
+        rep_k = k[0] if isinstance(k, list) else k
+        _enrich_metrics_with_regime(
+            metrics,
+            rep_m,
+            rep_n,
+            rep_k,
+            mem_bw_roofline_gbps,
+            compute_roofline_tflops,
+            is_grouped=True,
+            num_groups=num_groups,
+        )
 
         results.append(metrics)
 
@@ -434,7 +610,6 @@ def benchmark(
     k: int,
     mem_bw_roofline_gbps: float,
     opts: BenchOptions,
-    bench_quantize: bool = False,
     shape_mode: ShapeMode = ShapeMode.REGULAR,
 ) -> list[Metrics]:
     # Create input tensors.
@@ -477,45 +652,38 @@ def benchmark(
         if noise_power > 0:
             metrics.sqnr = (10 * torch.log10(signal_power / noise_power)).item()
 
-        for _ in range(opts.num_iters):
-            # Now perform benchmark.
-            if bench_quantize:
-                # Benchmark both quantize and compute.
-                with profiler(enabled=opts.trace, with_stack=True):
-                    ms_runtime = gemm_op.benchmark(
-                        *preprocessed_args,
-                        opts=opts,
-                        bench_quantize=True,
-                    )
-            else:
-                with profiler(enabled=opts.trace, with_stack=True):
-                    ms_runtime = gemm_op.benchmark(
-                        *quantized_vals,
-                        opts=opts,
-                        bench_quantize=False,
-                    )
+        bench_opts = _get_bench_options(opts)
 
-            tflops = 2 * m * n * k / (ms_runtime / 1e3) / 1e12
-            metrics.tflops += tflops
-            gbps = (
-                (
-                    quantized_vals[0].numel() * quantized_vals[0].element_size()
-                    + quantized_vals[1].numel() * quantized_vals[1].element_size()
-                    + output.numel() * output.element_size()
+        # Now perform benchmark.
+        with profiler(enabled=opts.trace, with_stack=True):
+            if _stat_iterations > 1:
+                stat = gemm_op.benchmark_statistical(
+                    *quantized_vals,
+                    opts=bench_opts,
+                    n_iterations=_stat_iterations,
                 )
-                / (ms_runtime / 1e3)
-                / 1e9
+                ms_runtime = _record_statistics(metrics, stat)
+            else:
+                ms_runtime = gemm_op.benchmark(*quantized_vals, opts=bench_opts)
+
+        metrics.ms = ms_runtime
+        metrics.tflops = 2 * m * n * k / (ms_runtime / 1e3) / 1e12
+        metrics.gbps = (
+            (
+                quantized_vals[0].numel() * quantized_vals[0].element_size()
+                + quantized_vals[1].numel() * quantized_vals[1].element_size()
+                + output.numel() * output.element_size()
             )
-            metrics.gbps += gbps
-            metrics.mem_bw_util += (gbps / mem_bw_roofline_gbps) * 100
-            if compute_roofline_tflops is not None:
-                metrics.compute_util += (tflops / compute_roofline_tflops) * 100
-            metrics.ms += ms_runtime
-        metrics.ms /= opts.num_iters
-        metrics.tflops /= opts.num_iters
-        metrics.gbps /= opts.num_iters
-        metrics.mem_bw_util /= opts.num_iters
-        metrics.compute_util /= opts.num_iters
+            / (ms_runtime / 1e3)
+            / 1e9
+        )
+        metrics.mem_bw_util = (metrics.gbps / mem_bw_roofline_gbps) * 100
+        if compute_roofline_tflops is not None:
+            metrics.compute_util = (metrics.tflops / compute_roofline_tflops) * 100
+
+        _enrich_metrics_with_regime(
+            metrics, m, n, k, mem_bw_roofline_gbps, compute_roofline_tflops
+        )
 
         results.append(metrics)
 
@@ -587,11 +755,6 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
     help="Enable a set of environment variables for AMD GPU performance",
 )
 @click.option(
-    "--bench-quantize",
-    is_flag=True,
-    help="If set, include quantization cost in benchmark.",
-)
-@click.option(
     "--M",
     default=None,
     help="Comma separated list of M values to benchmark.",
@@ -609,7 +772,10 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
 @click.option(
     "--pair-NK",
     is_flag=True,
-    help="If set, instead of benchmarking cartesian product of N * K, benchmark consecutive NK pairs together.",
+    help=(
+        "If set, instead of benchmarking cartesian product of N * K, "
+        "benchmark consecutive NK pairs together."
+    ),
 )
 @click.option(
     "--grouped",
@@ -620,7 +786,10 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
 @click.option(
     "--groups",
     default=None,
-    help="If set with grouped mode, repeat MNK shapes this many times. Comma separated list of groups to benchmark",
+    help=(
+        "If set with grouped mode, repeat MNK shapes this many times. "
+        "Comma separated list of groups to benchmark"
+    ),
 )
 @click.option(
     "--total-K",
@@ -646,14 +815,42 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
     is_flag=True,
     help="If set, torch.compile will be used for scaled_mm backed ops.",
 )
+@click.option(
+    "--empirical-roofline",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to empirical roofline JSON (replaces datasheet peaks).",
+)
+@click.option(
+    "--cold-l2/--no-cold-l2",
+    default=False,
+    help="Force a rotating buffer for cold-L2 measurements.",
+)
+@click.option(
+    "--target-matrix",
+    "target_matrix_path",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to target matrix YAML for pass/fail evaluation.",
+)
+@click.option(
+    "--stat-iterations",
+    default=1,
+    type=int,
+    help="Number of benchmark iterations for CoV. Use >=5 for reliable stats.",
+)
+@click.option(
+    "--cov-bound",
+    default=3.0,
+    type=float,
+    help="Maximum acceptable CoV %%. Warn if exceeded.",
+)
 def invoke_main(
     output_dir: str,
-    num_iters: int,
     export_csv: bool,
     export_scuba: bool,
     plot: bool,
     enable_amd_env_vars: bool,
-    bench_quantize: bool,
     kernels: Optional[str],
     m: Optional[str],
     n: Optional[str],
@@ -670,7 +867,34 @@ def invoke_main(
     disable_fast_accum: bool,
     torch_compile: bool,
     rep_ms: int,
+    empirical_roofline: Optional[str],
+    cold_l2: bool,
+    target_matrix_path: Optional[str],
+    stat_iterations: int,
+    cov_bound: float,
 ):
+    # Load empirical roofline if provided
+    if empirical_roofline:
+        roofline = load_empirical_roofline(empirical_roofline)
+        set_empirical_roofline(roofline)
+        print(f"Using empirical roofline from {empirical_roofline}")
+        print(f"  MFMA peaks: {roofline.mfma_peak_tflops}")
+        print(f"  HBM BW: {roofline.hbm_bw_gbps:.1f} GB/s")
+
+    if target_matrix_path:
+        matrix = load_target_matrix(target_matrix_path)
+        set_target_matrix(matrix)
+        target_count = len(matrix.targets)
+        print(
+            f"Loaded target matrix from {target_matrix_path} ({target_count} targets)"
+        )
+
+    set_bench_options(
+        stat_iterations=stat_iterations,
+        cov_bound=cov_bound,
+        cold_l2=cold_l2,
+    )
+
     if enable_amd_env_vars:
         set_amd_env_vars()
 
@@ -693,10 +917,6 @@ def invoke_main(
         print_kernels(all_kernels)
         sys.exit(1)
 
-    if num_iters < 1:
-        print("Warning: Number of iterations must be at least 1.")
-        num_iters = 1
-
     # Enumerate shapes to benchmark.
     if grouped and not groups:
         # In grouped mode, M, N, and K represent the groups of a single gemm.
@@ -714,7 +934,8 @@ def invoke_main(
         if shapes:
             if shapes not in shape_registry:
                 print(
-                    f"Shape {shapes} not found in shape registry. Valid shapes: {', '.join(shape_registry.keys())}."
+                    f"Shape {shapes} not found in shape registry. "
+                    f"Valid shapes: {', '.join(shape_registry.keys())}."
                 )
                 sys.exit(1)
             MNK = shape_registry[shapes]()
@@ -777,13 +998,12 @@ def invoke_main(
         shape_mode = ShapeMode.REGULAR
 
     # Iterate over shapes and benchmark.
-    mem_bw_gbps = triton.testing.get_dram_gbps()
+    mem_bw_gbps = get_hbm_bw_gbps()
     benchmark_results: list[Metrics] = []
     csv: list[dict[str, Any]] = []
     benchmark_func = benchmark_grouped if grouped else benchmark
 
     opts = BenchOptions(
-        num_iters=num_iters,
         cuda_graph=cuda_graph,
         rotating_buffer=rotating_buffer,
         rep_ms=rep_ms,
@@ -800,7 +1020,6 @@ def invoke_main(
             k,  # pyre-ignore[6]: Incompatible parameter type [6]
             mem_bw_gbps,
             opts,
-            bench_quantize,
             shape_mode,
         )
         benchmark_results.extend(shape_measurements)
@@ -817,6 +1036,8 @@ def invoke_main(
     print("")
     print(f"Hardware: {torch.cuda.get_device_name()}")
     print(f"    Memory BW: {mem_bw_gbps:.2f} GB/s")
+    roofline_src = "empirical" if _empirical_roofline is not None else "datasheet"
+    print(f"    Roofline source: {roofline_src}")
 
     print("")
     print("Benchmark Settings:")
@@ -824,6 +1045,12 @@ def invoke_main(
     print(f"    Buffer rotation: {rotating_buffer}")
     print(f"    Fast accumulation: {not disable_fast_accum}")
     print(f"    Torch compile: {torch_compile}")
+    if stat_iterations > 1:
+        print(
+            f"    Statistical iterations: {stat_iterations} (CoV bound: {cov_bound}%)"
+        )
+    if cold_l2:
+        print("    Cold L2: enabled for R3 shapes")
 
     if export_csv or plot:
         os.makedirs(output_dir, exist_ok=True)

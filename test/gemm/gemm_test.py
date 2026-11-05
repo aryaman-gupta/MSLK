@@ -7,6 +7,7 @@
 # pyre-strict
 # pyre-ignore-all-errors[56]
 
+import os
 import unittest
 from typing import Optional, Union
 
@@ -14,15 +15,20 @@ import mslk.gemm  # noqa: F401
 import mslk.quantize  # noqa: F401
 import torch
 import triton  # noqa: F401
+from mslk.flydsl.common import (
+    flydsl_version,
+    is_flydsl_version_at_least,
+    MIN_FLYDSL_VERSION,
+)
 from mslk.quantize.triton.fp4_quantize import (
     _to_blocked,
     calculate_group_max,
-    get_nvfp4_global_scales_naive,
     nvfp4_quantize_stacked,
     nvfp4_quantize_stacked_with_token_scale,
-    quantize_nvfp4_naive,
     triton_quantize_mx4_unpack,
+    triton_quantize_nvfp4,
 )
+from mslk.quantize.triton.fp4_utils import global_scale_nvfp4
 from mslk.testing.device import (
     skipUnlessCuda,
     skipUnlessCudaCapability,
@@ -33,7 +39,16 @@ from mslk.testing.device import (
 from mslk.utils.device import compute_capability_in, supports_float8_fnuz
 
 if torch.cuda.is_available():
-    from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row
+    from mslk.gemm.flydsl.preshuffle_gemm import (
+        flydsl_preshuffle,
+        flydsl_preshuffle_batched_gemm,
+        flydsl_preshuffle_gemm,
+    )
+    from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
+    from mslk.quantize.mx_mixed_dtype_utils import (
+        pack_fp6_e2m3,
+        quantize_bf16_to_mx6_e2m3,
+    )
     from mslk.quantize.shuffle import quantize_int4_preshuffle
     from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
 
@@ -49,6 +64,8 @@ try:
         MARLIN_ENABLED = True
 except ImportError:
     pass
+
+running_on_github: bool = os.getenv("GITHUB_ENV") is not None
 
 # Device gating for the GEMM kernels exercised in this file uses the shared skip
 # decorators from mslk.testing.device: the strict platform gates
@@ -151,15 +168,13 @@ def generate_jagged_offs(E, M, multiple_of=16, dtype=torch.int32, device="cuda")
 
 
 def _fp8_gemm_cases() -> list[tuple]:
-    modes = ["rowwise"] + (
-        # Blockwise fp8 GEMM is numerically broken on AMD/MI300 (~99% relative
-        # RMS error at all K); the loose tolerance only masked it while K was
-        # small. Keep it NVIDIA-only until the CK kernel
-        # (mslk/csrc/gemm/ck/fp8_blockwise_gemm.hip) is fixed. See T275007617.
-        ["blockwise"]
-        if torch.version.cuda is not None and compute_capability_in(9, 9)
-        else []
-    )
+    # Blockwise FP8 GEMM: CUDA uses CUTLASS; ROCm uses the FlyDSL kernel that
+    # replaced the broken CK kernel, falling back to Triton's matmul_fp8_block
+    # wherever FlyDSL cannot serve the arch.
+    blockwise_supported = (
+        torch.version.cuda is not None and compute_capability_in(9, 9)
+    ) or torch.version.hip is not None
+    modes = ["rowwise"] + (["blockwise"] if blockwise_supported else [])
 
     def case(
         M: int,
@@ -194,16 +209,16 @@ def _fp8_gemm_cases() -> list[tuple]:
         case(2048, 256, 4096, cudagraph=True),
         case(2048, 256, 4096, multi_dim=True),
     ]
+    cases += [case(2048, 256, 4096, use_triton=True)]
     if torch.version.cuda is not None:
         cases += [
-            case(2048, 256, 4096, use_triton=True),
             case(2048, 256, 4096, fast_accum=False),  # slow accumulation
         ]
     return [(*case, mode) for mode in modes for case in cases]
 
 
 def _fp8_batched_gemm_cases() -> list[tuple]:
-    modes = ["default"] + (["torch_3d3d"] if torch.version.hip else [])
+    modes = ["default", "torch_3d3d"]
     cases = []
     for mode in modes:
         for use_loopover in (True, False):
@@ -223,7 +238,13 @@ class ExportCompileTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        fp8_dtype = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
+        fp8_dtype = (
+            torch.float8_e4m3fnuz
+            if supports_float8_fnuz(
+                throw_on_hip_incompatibility=(not running_on_github)
+            )
+            else torch.float8_e4m3fn
+        )
         cls.device = torch.accelerator.current_accelerator()
         cls.M = 256
         cls.N = 256
@@ -255,7 +276,7 @@ class ExportCompileTests(unittest.TestCase):
         model = TestModule().cuda()
         M, N, K = 256, 256, 256
         fp8_dtype = torch.float8_e4m3fn
-        if torch.version.hip:
+        if supports_float8_fnuz(throw_on_hip_incompatibility=(not running_on_github)):
             fp8_dtype = torch.float8_e4m3fnuz
         xq = torch.randn(M, K).to(fp8_dtype).cuda()
         wq = torch.randn(N, K).to(fp8_dtype).cuda()
@@ -328,7 +349,7 @@ class F8F8F16RowwiseCompileTests(unittest.TestCase):
         )
 
 
-@skipUnlessGfxArch("gfx942")
+@skipUnlessGfxArch("gfx942", "gfx950")
 @skipUnlessCudaCapability(9, 10)
 class FP8Tests(unittest.TestCase):
     @classmethod
@@ -577,6 +598,154 @@ class FP8Tests(unittest.TestCase):
 
         torch.testing.assert_close(y_ref, y_fp8, atol=8.0e-2, rtol=8.0e-2)
 
+    @skipUnlessRocm()
+    def test_grouped_gemm_large_group_setup_and_sparse_zeroing(self) -> None:
+        torch.manual_seed(0)
+        G, M, N, K = 257, 4, 512, 512
+        sentinel_groups = (0, G // 2, G - 1)
+        active_rows = torch.full((G,), M, dtype=torch.int64, device=self.device)
+        active_rows[list(sentinel_groups)] = torch.tensor(
+            [1, 2, 3], dtype=torch.int64, device=self.device
+        )
+
+        x = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+
+        y_zeroed = torch.ops.mslk.f8f8bf16_rowwise_grouped_dynamic(
+            xq, wq, x_scale, w_scale, active_rows, True
+        )
+        y_uninitialized = torch.ops.mslk.f8f8bf16_rowwise_grouped_dynamic(
+            xq, wq, x_scale, w_scale, active_rows, False
+        )
+        y_bf16 = torch.ops.mslk.bf16bf16bf16_grouped_dynamic(x, w, active_rows)
+
+        x_stacked = torch.cat(
+            [x[group, : active_rows[group].item()] for group in range(G)]
+        )
+        xq_stacked, x_scale_stacked = quantize_fp8_row(x_stacked)
+        y_fp8_stacked = torch.ops.mslk.f8f8bf16_rowwise_grouped_stacked(
+            xq_stacked, wq, x_scale_stacked, w_scale, active_rows
+        )
+        y_bf16_stacked = torch.ops.mslk.bf16bf16bf16_grouped_stacked(
+            x_stacked, w, active_rows
+        )
+        stacked_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64, device=self.device),
+                torch.cumsum(active_rows, dim=0),
+            ]
+        )
+
+        full_output = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+        y_grouped_mm = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+            xq, wq, x_scale, w_scale, None, full_output
+        )
+
+        for group in sentinel_groups:
+            rows = active_rows[group].item()
+            expected = x[group, :rows] @ w[group].t()
+            torch.testing.assert_close(
+                y_zeroed[group, :rows], expected, atol=8.0e-2, rtol=8.0e-2
+            )
+            torch.testing.assert_close(
+                y_uninitialized[group, :rows],
+                expected,
+                atol=8.0e-2,
+                rtol=8.0e-2,
+            )
+            torch.testing.assert_close(
+                y_bf16[group, :rows], expected, atol=8.0e-3, rtol=8.0e-3
+            )
+            torch.testing.assert_close(
+                y_grouped_mm[group],
+                x[group] @ w[group].t(),
+                atol=8.0e-2,
+                rtol=8.0e-2,
+            )
+            self.assertEqual(torch.count_nonzero(y_zeroed[group, rows:]).item(), 0)
+            self.assertEqual(torch.count_nonzero(y_bf16[group, rows:]).item(), 0)
+
+            start = stacked_offsets[group].item()
+            end = stacked_offsets[group + 1].item()
+            torch.testing.assert_close(
+                y_fp8_stacked[start:end], expected, atol=8.0e-2, rtol=8.0e-2
+            )
+            torch.testing.assert_close(
+                y_bf16_stacked[start:end], expected, atol=8.0e-3, rtol=8.0e-3
+            )
+
+    @skipUnlessRocm()
+    def test_gemm_rowwise_weight_at_reused_address(self) -> None:
+        # Each weight is freed just before the next is quantized, and no other
+        # tensor here has its size, so the allocator hands the new weight the
+        # old one's address; every result must still come from its own weight.
+        M, K, N = 128, 256, 1024
+        wq = None
+        for _ in range(3):
+            x = torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
+            w = torch.randn((N, K), dtype=torch.bfloat16, device=self.device)
+            xq, x_scale = quantize_fp8_row(x)
+            del wq
+            wq, w_scale = quantize_fp8_row(w)
+            out = torch.ops.mslk.f8f8bf16_rowwise(xq, wq, x_scale, w_scale)
+            ref = (xq.float() @ wq.float().T) * x_scale[:, None] * w_scale[None, :]
+            torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+    @skipUnlessRocm()
+    def test_grouped_gemm_more_groups_than_threads_per_block(self) -> None:
+        # ROCm serves these ops from FlyDSL, which grid-strides over groups
+        # rather than giving each its own thread in a single CTA, so group
+        # counts past the CTA size must still compute every group.
+        M, N, K_per_group = 2, 16, 16
+        fp8_dtype = quantize_fp8_row(
+            torch.zeros((1, K_per_group), dtype=torch.bfloat16, device=self.device)
+        )[0].dtype
+        max_threads = torch.cuda.get_device_properties(
+            self.device
+        ).max_threads_per_block
+
+        def fp8(*shape: int) -> torch.Tensor:
+            return torch.randn(shape, device=self.device).to(fp8_dtype)
+
+        def scales(n: int) -> torch.Tensor:
+            return torch.rand(n, dtype=torch.float32, device=self.device) + 0.5
+
+        for G in (32, max_threads + 1):
+            # 2D-2D: groups along K.
+            xq, wq = fp8(M, G * K_per_group), fp8(N, G * K_per_group)
+            x_scale, w_scale = scales(G * M), scales(G * N)
+            offsets = torch.arange(
+                K_per_group,
+                G * K_per_group + 1,
+                K_per_group,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            out = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+            torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+                xq, wq, x_scale, w_scale, offsets, out
+            )
+            ref = torch.einsum(
+                "mgk,ngk->gmn",
+                xq.float().view(M, G, K_per_group),
+                wq.float().view(N, G, K_per_group),
+            )
+            ref = ref * x_scale.view(G, M, 1) * w_scale.view(G, 1, N)
+            torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+            # Stacked: one row per group, groups along M.
+            xq, wq = fp8(G, K_per_group), fp8(G, N, K_per_group)
+            x_scale, w_scale = scales(G), scales(G * N)
+            m_sizes = torch.ones((G,), dtype=torch.int64, device=self.device)
+            out = torch.ops.mslk.f8f8bf16_rowwise_grouped_stacked(
+                xq, wq, x_scale, w_scale, m_sizes
+            )
+            ref = torch.einsum("gk,gnk->gn", xq.float(), wq.float())
+            ref = ref * x_scale.view(G, 1) * w_scale.view(G, N)
+            torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
     @parameterized.expand(
         [
             (1, 512, 512, 512),  # small MNK (also small G)
@@ -698,6 +867,253 @@ class FP8Tests(unittest.TestCase):
 
         # Compare using loopover BF16 gemm
         self.bf16_loopover_validate(X_list, W_list, y)
+
+    @parameterized.expand(
+        [
+            # Group K that does not divide the K tile while the TOTAL does.
+            # Whether the total is tile-aligned says nothing about a group's
+            # slice, so a tail predicate keyed on the total is not emitted here
+            # and each group reads into the next one's data.
+            ([288] * 4,),  # total 1152
+            ([192, 320],),  # total 512
+            ([16, 512, 128, 368],),  # total 1024, mixed
+            ([0, 256, 256, 512],),  # total 1024, with an empty group
+        ]
+    )
+    @skipUnlessRocm()
+    def test_grouped_gemm_2d_2d_group_k_not_tile_aligned(
+        self, k_sizes: list[int]
+    ) -> None:
+        """Groups divide K at extents that do not land on a tile boundary.
+
+        The parameterised cases above keep every group's K a multiple of 16, the
+        vectorised load width, since neither implementation supports less.
+
+        Every other group holds constant, single-signed data. A read that runs
+        past a group's K end lands in the next group, and against constants the
+        extra terms accumulate coherently rather than cancelling, which puts the
+        error orders of magnitude above the comparison tolerance. Random
+        neighbours would leave it near the quantisation noise, where the
+        comparison cannot tell the two apart.
+        """
+        M, N = 128, 256
+        G = len(k_sizes)
+        K_offsets = torch.cumsum(torch.tensor(k_sizes, dtype=torch.int), dim=0).to(
+            device=self.device, dtype=torch.int32
+        )
+
+        X_list, W_list = [], []
+        xq_list, wq_list, x_scale_list, w_scale_list = [], [], [], []
+        for g, k_size in enumerate(k_sizes):
+            # A zero-width group still has to contribute a scale per row.
+            width = max(k_size, 1)
+            if g % 2:
+                X = torch.full(
+                    (M, width), 0.1, dtype=torch.bfloat16, device=self.device
+                )
+                W = torch.full(
+                    (N, width), 0.01, dtype=torch.bfloat16, device=self.device
+                )
+            else:
+                X = (
+                    torch.randn((M, width), dtype=torch.bfloat16, device=self.device)
+                    * 0.1
+                )
+                W = (
+                    torch.randn((N, width), dtype=torch.bfloat16, device=self.device)
+                    * 0.01
+                )
+            xq, x_scale = quantize_fp8_row(X)
+            wq, w_scale = quantize_fp8_row(W)
+            X_list.append(X[:, :k_size])
+            W_list.append(W[:, :k_size])
+            xq_list.append(xq[:, :k_size])
+            wq_list.append(wq[:, :k_size])
+            x_scale_list.append(x_scale)
+            w_scale_list.append(w_scale)
+
+        xq = torch.cat(xq_list, dim=1)
+        wq = torch.cat(wq_list, dim=1)
+        x_scale = torch.cat(x_scale_list, dim=0)
+        w_scale = torch.cat(w_scale_list, dim=0)
+        out = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+
+        y = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+            xq, wq, x_scale, w_scale, K_offsets, out
+        )
+
+        # A group that contracts over nothing contributes nothing; the op leaves
+        # its slab alone, so only the rest is checked.
+        live = [g for g, k in enumerate(k_sizes) if k]
+        self.bf16_loopover_validate(
+            [X_list[g] for g in live],
+            [W_list[g] for g in live],
+            [y[g] for g in live],
+        )
+
+    @parameterized.expand(
+        [
+            ([264, 264],),  # a multiple of 8, not of any tile_n
+            ([8, 504, 128],),  # one group narrower than a single tile
+            ([1024, 264, 8],),
+        ]
+    )
+    @skipUnlessRocm()
+    def test_grouped_gemm_3d_2d_group_n_not_tile_aligned(
+        self, n_sizes: list[int]
+    ) -> None:
+        """Groups divide N at extents that do not land on a tile boundary.
+
+        Every group's N stays a multiple of 8, the widest vectorised store,
+        which CK asserts on the device and this kernel needs for the same reason.
+        """
+        M, K = 128, 256
+        G = len(n_sizes)
+        total_n = sum(n_sizes)
+        N_offsets = torch.cumsum(torch.tensor(n_sizes, dtype=torch.int), dim=0).to(
+            device=self.device, dtype=torch.int32
+        )
+
+        X = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn((total_n, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        xq, x_scale = quantize_fp8_row(X)
+        wq, w_scale = quantize_fp8_row(W)
+        out = torch.empty((M, total_n), dtype=torch.bfloat16, device=self.device)
+
+        y = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+            xq, wq, x_scale.view(G, -1), w_scale, N_offsets, out
+        )
+
+        self.bf16_loopover_validate(
+            list(X),
+            list(torch.split(W, n_sizes, dim=0)),
+            list(torch.split(y, n_sizes, dim=1)),
+        )
+
+    @parameterized.expand([(1,), (64,), (100,), (192,), (255,)])
+    @skipUnlessRocm()
+    def test_grouped_gemm_3d_3d_slab_not_tile_aligned(self, M: int) -> None:
+        """Batched, with a slab height that does not divide the M tile.
+
+        A full slab does not mean a tile fits inside it: the last tile overhangs
+        into the next group's rows, so the epilogue still has to mask by row.
+        """
+        G, N, K = 4, 256, 256
+        X = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        xq, x_scale = quantize_fp8_row(X)
+        wq, w_scale = quantize_fp8_row(W)
+        out = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+
+        y = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+            xq, wq, x_scale.view(G, -1), w_scale.view(G, -1), None, out
+        )
+
+        self.bf16_loopover_validate(list(X), list(W), list(y))
+
+    @parameterized.expand([("2d3d",), ("3d3d",)])
+    @skipUnlessRocm()
+    def test_grouped_gemm_mm_preshuffle(self, ranks: str) -> None:
+        """The grouped mm ranks that leave each group a whole [N, K].
+
+        Weights arrive already in the MFMA B layout, which the caller applies
+        once at load time.
+        """
+        from mslk.flydsl.common import is_flydsl_available
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        if not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
+        if not hasattr(torch.ops.mslk, "f8f8bf16_rowwise_grouped_mm_preshuffle"):
+            self.skipTest("build predates the preshuffled grouped mm schema")
+
+        G, M, N, K = 4, 128, 256, 256
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        wq, w_scale = quantize_fp8_row(W)
+        op = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm_preshuffle
+
+        if ranks == "2d3d":
+            m_sizes = [64, 128, 32, 64]
+            offsets = torch.cumsum(torch.tensor(m_sizes, dtype=torch.int), dim=0).to(
+                device=self.device, dtype=torch.int32
+            )
+            total_m = sum(m_sizes)
+            X = (
+                torch.randn((total_m, K), dtype=torch.bfloat16, device=self.device)
+                * 0.1
+            )
+            xq, x_scale = quantize_fp8_row(X)
+            out = torch.empty((total_m, N), dtype=torch.bfloat16, device=self.device)
+            y = op(xq, preshuffle_b_mfma(wq), x_scale, w_scale, offsets, out)
+            X_list, W_list, y_list, row = [], [], [], 0
+            for g, m_g in enumerate(m_sizes):
+                X_list.append(X[row : row + m_g])
+                W_list.append(W[g])
+                y_list.append(y[row : row + m_g])
+                row += m_g
+        else:
+            X = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            xq, x_scale = quantize_fp8_row(X)
+            out = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+            y = op(
+                xq,
+                preshuffle_b_mfma(wq),
+                x_scale.view(G, -1),
+                w_scale.view(G, -1),
+                None,
+                out,
+            )
+            X_list, W_list, y_list = list(X), list(W), list(y)
+
+        self.bf16_loopover_validate(X_list, W_list, y_list)
+
+    @skipUnlessRocm()
+    def test_grouped_gemm_mm_preshuffle_rejects_grouped_n_and_k(self) -> None:
+        """Grouping along N or K puts a group boundary inside the swizzle.
+
+        There is no preshuffled form of those, so they have to be refused rather
+        than quietly served from the plain path.
+        """
+        from mslk.flydsl.common import is_flydsl_available
+
+        if not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
+        from mslk.gemm.flydsl.fp8_rowwise_grouped_gemm import (
+            matmul_f8f8bf16_rowwise_grouped_mm_preshuffle as op,
+        )
+
+        G, M, N, K = 4, 128, 256, 256
+        X3 = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W2 = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        xq3, xs3 = quantize_fp8_row(X3)
+        wq2, ws2 = quantize_fp8_row(W2)
+        n_offsets = torch.cumsum(torch.full((G,), N // G, dtype=torch.int), dim=0).to(
+            device=self.device, dtype=torch.int32
+        )
+        with self.assertRaisesRegex(ValueError, "3D-2D groups along N"):
+            op(
+                xq3,
+                wq2,
+                xs3.view(G, -1),
+                ws2,
+                n_offsets,
+                torch.empty((M, N), dtype=torch.bfloat16, device=self.device),
+            )
+
+        X2 = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        xq2, xs2 = quantize_fp8_row(X2)
+        k_offsets = torch.cumsum(torch.full((G,), K // G, dtype=torch.int), dim=0).to(
+            device=self.device, dtype=torch.int32
+        )
+        with self.assertRaisesRegex(ValueError, "2D-2D groups along K"):
+            op(
+                xq2,
+                wq2,
+                xs2,
+                ws2,
+                k_offsets,
+                torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device),
+            )
 
     def bf16_loopover_validate(
         self,
@@ -831,6 +1247,333 @@ class FP8Tests(unittest.TestCase):
 
         # BF16 loopover gemm reference
         self.bf16_loopover_validate(x_group, W, y_fp8_group, y_bf16_group)
+
+    @skipUnlessRocm()
+    def test_bf16_grouped_k_tail_alignment(self) -> None:
+        from mslk.gemm.flydsl.bf16_grouped_gemm import is_supported
+
+        if not is_supported():
+            self.skipTest("requires a compatible FlyDSL backend")
+        M_sizes = torch.tensor([16, 24], dtype=torch.int64, device=self.device)
+        total_m = int(M_sizes.sum().item())
+        n, k = 512, 520
+        x = torch.randn((total_m, k), dtype=torch.bfloat16, device=self.device)
+        w = torch.randn((2, n, k), dtype=torch.bfloat16, device=self.device)
+
+        actual = torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, M_sizes)
+        expected = torch.cat(
+            [
+                x[:16].float().matmul(w[0].float().T),
+                x[16:].float().matmul(w[1].float().T),
+            ]
+        ).to(torch.bfloat16)
+
+        torch.testing.assert_close(actual, expected, atol=8.0e-3, rtol=8.0e-3)
+
+    @skipUnlessRocm()
+    def test_packed_large_operand_uses_tile_descriptors(self) -> None:
+        from mslk.gemm.flydsl.grouped_dispatch import (
+            _addressing_plan,
+            _BUFFER_LIMIT_BYTES,
+        )
+
+        total_m = _BUFFER_LIMIT_BYTES // (512 * 2)
+        self.assertEqual(
+            _addressing_plan(total_m, 512, 512, 1, 2, "sizes", 128),
+            (False, "tile"),
+        )
+
+    @skipUnlessRocm()
+    def test_irreducibly_large_work_tile_is_rejected(self) -> None:
+        from mslk.gemm.flydsl.grouped_dispatch import (
+            _addressing_plan,
+            _BUFFER_LIMIT_BYTES,
+        )
+
+        k = _BUFFER_LIMIT_BYTES // (32 * 2)
+        with self.assertRaisesRegex(ValueError, "A \\(one work tile\\)"):
+            _addressing_plan(32, 1, k, 1, 2, "sizes", 32)
+
+    @skipUnlessRocm()
+    def test_packed_tile_descriptor_variant_compiles(self) -> None:
+        from mslk.flydsl.kernels.gemm.fp8_grouped_gemm import compile_fp8_grouped_gemm
+
+        launcher = compile_fp8_grouped_gemm(
+            n=512,
+            k=512,
+            num_groups=2,
+            tile_m=128,
+            tile_n=128,
+            tile_k=64,
+            b_preshuffled=False,
+            in_dtype="bf16",
+            scaling="none",
+            layout="sizes",
+            row_basing="tile",
+        )
+        self.assertTrue(callable(launcher))
+
+    @skipUnlessRocm()
+    def test_bf16_grouped_out_must_be_contiguous(self) -> None:
+        m, n, k = 16, 512, 512
+        x = torch.randn((m, k), dtype=torch.bfloat16, device=self.device)
+        w = torch.randn((1, n, k), dtype=torch.bfloat16, device=self.device)
+        m_sizes = torch.tensor([m], dtype=torch.int64, device=self.device)
+        out = torch.empty((n, m), dtype=torch.bfloat16, device=self.device).T
+
+        with self.assertRaisesRegex(AssertionError, "out must be contiguous"):
+            torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, m_sizes, out)
+
+    @skipUnlessRocm()
+    def test_bf16_grouped_non_current_device(self) -> None:
+        if torch.cuda.device_count() < 2:
+            self.skipTest("requires two GPUs")
+        current_device = torch.cuda.current_device()
+        other_device = 1 if current_device == 0 else 0
+        device = torch.device("cuda", other_device)
+        m, n, k = 16, 512, 512
+        x = torch.randn((m, k), dtype=torch.bfloat16, device=device)
+        w = torch.randn((1, n, k), dtype=torch.bfloat16, device=device)
+        m_sizes = torch.tensor([m], dtype=torch.int64, device=device)
+
+        actual = torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, m_sizes)
+        expected = x.float().matmul(w[0].float().T).to(torch.bfloat16)
+
+        self.assertEqual(torch.cuda.current_device(), current_device)
+        self.assertEqual(actual.device, device)
+        torch.testing.assert_close(actual, expected, atol=8.0e-3, rtol=8.0e-3)
+
+    @skipUnlessRocm()
+    def test_bf16_grouped_rejects_device_mismatch(self) -> None:
+        if torch.cuda.device_count() < 2:
+            self.skipTest("requires two GPUs")
+        x = torch.randn((16, 512), dtype=torch.bfloat16, device="cuda:0")
+        w = torch.randn((1, 512, 512), dtype=torch.bfloat16, device="cuda:1")
+        m_sizes = torch.tensor([16], dtype=torch.int64, device="cuda:0")
+
+        with self.assertRaisesRegex(AssertionError, "W must be on"):
+            torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, m_sizes)
+
+    @parameterized.expand(
+        [
+            (1, 512, 512, 512, True),  # small MNK (also small G)
+            (16, 256, 1024, 2048, True),  # medium MNK
+            (64, 128, 6144, 3584, True),  # large MNK
+            (16, 512, 512, 512, True),  # medium G
+            (64, 512, 512, 512, True),  # large G
+            (4, 256, 1024, 512, False),  # padding left uninitialised
+        ]
+    )
+    @skipUnlessRocm()
+    def test_grouped_gemm_dynamic(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+        zeroing_output_tensor: bool,
+    ) -> None:
+        """Padded per-group layout: [G, M, K] with a runtime valid row count.
+
+        Unlike the stacked variant the groups do not share one packed buffer;
+        each gets a fixed slab of M rows of which only the first
+        zero_start_index_M[g] hold real tokens. The rest is padding, so the
+        reference only covers the valid rows, and the padded output rows are
+        checked separately.
+        """
+        # Cover empty, partially filled and completely filled groups.
+        valid_m = torch.randint(0, M + 1, (G,), dtype=torch.int64)
+        valid_m[0] = 0
+        valid_m[-1] = M
+        valid_m_gpu = valid_m.to(device=self.device)
+
+        X = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(X)
+        wq, w_scale = quantize_fp8_row(W)
+
+        y = torch.ops.mslk.f8f8bf16_rowwise_grouped_dynamic(
+            xq, wq, x_scale, w_scale, valid_m_gpu, zeroing_output_tensor
+        )
+        self.assertEqual(tuple(y.shape), (G, M, N))
+
+        # Only the valid rows of each group are defined by the op, so compare
+        # those and leave the padding to the check below.
+        x_group = [X[g, : valid_m[g]] for g in range(G)]
+        w_group = [W[g] for g in range(G)]
+        y_group = [y[g, : valid_m[g]] for g in range(G)]
+        self.bf16_loopover_validate(x_group, w_group, y_group)
+
+        if zeroing_output_tensor:
+            for g in range(G):
+                padding = y[g, valid_m[g] :]
+                self.assertTrue(
+                    (padding == 0).all().item(),
+                    f"group {g} padding rows must be zeroed",
+                )
+
+
+@skipUnlessGfxArch("gfx942", "gfx950")
+@skipUnlessCudaCapability(9, 10)
+class FP8GroupwiseTests(unittest.TestCase):
+    """Correctness tests for the FP8 groupwise GEMM kernel (f8f8bf16_groupwise).
+
+    On CUDA the CUTLASS implementation is exercised; on ROCm the Triton kernel.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @parameterized.expand(
+        [
+            (128, 128, 256),  # small
+            (512, 1024, 2048),  # medium
+            (1, 128, 256),  # M=1 decode
+            (2048, 6144, 3584),  # large
+        ]
+    )
+    def test_f8f8bf16_groupwise(self, M: int, N: int, K: int) -> None:
+        from mslk.quantize.triton.fp8_quantize import (
+            quantize_fp8_block,
+            quantize_fp8_group,
+        )
+
+        x = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        # Quantize: x_scale [K//128, M], w_scale [K//128, N//128]
+        xq, x_scale = quantize_fp8_group(x, k_major=False)
+        wq, w_scale = quantize_fp8_block(w, block_m=128, block_k=128, k_major=False)
+
+        out = torch.ops.mslk.f8f8bf16_groupwise(xq, wq, x_scale, w_scale)
+        ref = (x @ w.t()).to(torch.bfloat16)
+
+        self.assertFalse(out.isnan().any().item(), "Output contains NaN")
+        self.assertFalse(out.isinf().any().item(), "Output contains Inf")
+        torch.testing.assert_close(out, ref, atol=8.0e-2, rtol=8.0e-2)
+
+    @parameterized.expand(
+        [
+            (*case, preshuffle)
+            for preshuffle in [False, True]
+            for case in [
+                # (m_values, N, K)
+                ([128, 64], 128, 256),  # small, 2 groups
+                ([512, 256, 128], 256, 512),  # medium, 3 groups
+                ([1, 128, 256], 128, 256),  # decode + prefill mix
+                ([2048, 1024], 512, 512),  # large, 2 groups
+            ]
+        ]
+    )
+    def test_f8f8bf16_groupwise_grouped(
+        self, m_values: list, N: int, K: int, preshuffle: bool
+    ) -> None:
+        # FlyDSL backs both variants on ROCm, and the preshuffle op exists only
+        # there, so skip when it is unavailable.
+        from mslk.flydsl.common import is_flydsl_available
+        from mslk.quantize.triton.fp8_quantize import (
+            quantize_fp8_block,
+            quantize_fp8_group,
+        )
+
+        if (preshuffle or torch.version.hip is not None) and not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
+
+        G = len(m_values)
+        device = self.device
+        m_sizes = torch.tensor(m_values, dtype=torch.int64, device=device)
+        TotalM = sum(m_values)
+
+        x = torch.randn((TotalM, K), dtype=torch.bfloat16, device=device) * 0.1
+        ws = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=device) * 0.01
+            for _ in range(G)
+        ]
+
+        # Quantize weights: each [N, K] -> wq [N, K], w_scale [K//128, N//128].
+        wq_list, ws_list = zip(
+            *[
+                quantize_fp8_block(w, block_m=128, block_k=128, k_major=False)
+                for w in ws
+            ]
+        )
+        wq = torch.stack(wq_list, dim=0).contiguous()  # [G, N, K]
+        w_scale = torch.stack(ws_list, dim=0).contiguous()  # [G, K//128, N//128]
+
+        # Quantize activations: xq [TotalM, K], x_scale [K//128, TotalM].
+        xq, x_scale = quantize_fp8_group(x, m_sizes=m_sizes)
+
+        if preshuffle:
+            from mslk.quantize.shuffle import preshuffle_b_mfma
+
+            # The preshuffle op consumes weights already in the MFMA B layout;
+            # callers shuffle once at prep time.
+            out = torch.ops.mslk.f8f8bf16_groupwise_grouped_preshuffle(
+                xq, preshuffle_b_mfma(wq), x_scale, w_scale, m_sizes
+            )
+        else:
+            out = torch.ops.mslk.f8f8bf16_groupwise_grouped(
+                xq, wq, x_scale, w_scale, m_sizes
+            )
+
+        # BF16 reference: compute per group and concatenate.
+        ref_parts = []
+        row = 0
+        for g, m_g in enumerate(m_values):
+            ref_parts.append((x[row : row + m_g] @ ws[g].t()).to(torch.bfloat16))
+            row += m_g
+        ref = torch.cat(ref_parts, dim=0)
+
+        self.assertFalse(out.isnan().any().item(), "Output contains NaN")
+        self.assertFalse(out.isinf().any().item(), "Output contains Inf")
+        torch.testing.assert_close(out, ref, atol=1.0e-2, rtol=4.0e-2)
+
+    @parameterized.expand([(240,), (144,)])
+    @skipUnlessRocm()
+    def test_f8f8bf16_groupwise_grouped_rejects_partial_scale_block(
+        self, K: int
+    ) -> None:
+        """K covering a partial scale block has to be refused, not truncated.
+
+        Block scaling counts whole scale blocks along K; a partial one is left
+        out of that count and the scales are misindexed from there on, which
+        costs the tail of the contraction. The error that produces is small
+        enough to sit inside the tolerance this file compares with, so it has
+        to be refused at the boundary instead of checked for numerically.
+        """
+        from mslk.flydsl.common import is_flydsl_available
+        from mslk.quantize.triton.fp8_quantize import (
+            quantize_fp8_block,
+            quantize_fp8_group,
+        )
+
+        if not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
+
+        N = 256
+        m_values = [128, 64]
+        G = len(m_values)
+        m_sizes = torch.tensor(m_values, dtype=torch.int64, device=self.device)
+        total_m = sum(m_values)
+        x = torch.randn((total_m, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        ws = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        wq_list, ws_list = zip(
+            *[
+                quantize_fp8_block(w, block_m=128, block_k=128, k_major=False)
+                for w in ws
+            ]
+        )
+        wq = torch.stack(wq_list, dim=0).contiguous()
+        w_scale = torch.stack(ws_list, dim=0).contiguous()
+        xq, x_scale = quantize_fp8_group(x, m_sizes=m_sizes)
+
+        with self.assertRaisesRegex(ValueError, "scale_block_k"):
+            torch.ops.mslk.f8f8bf16_groupwise_grouped(xq, wq, x_scale, w_scale, m_sizes)
 
 
 @skipUnlessCuda()
@@ -1225,6 +1968,98 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         torch.testing.assert_close(y_op, y_direct, atol=0.0, rtol=0.0)
 
 
+@skipUnlessRocm()
+class FP8Int4TritonROCmTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from mslk.gemm.triton.f8i4bf16_rowwise_gemm import matmul_f8i4bf16_rowwise
+
+        cls.matmul_rowwise = staticmethod(matmul_f8i4bf16_rowwise)
+
+    def test_rowwise_accuracy_and_dispatch(self) -> None:
+        M, N, K, group_size = 1, 256, 1024, 128
+        x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * 0.01
+        xq, x_scale = quantize_fp8_row(x)
+        wq_unpacked, w_scale, w_zp = int4_row_quantize(w, group_size)
+        wq = pack_int4(wq_unpacked).contiguous().to(device="cuda")
+        w_scale = w_scale.contiguous().to(device="cuda")
+        w_zp = w_zp.contiguous().to(device="cuda")
+
+        y_direct = self.matmul_rowwise(xq, wq, x_scale, w_scale, w_zp)
+        y_op = torch.ops.mslk.f8i4bf16_rowwise(xq, wq, x_scale, w_scale, w_zp)
+        x_dequant = xq.float() * x_scale[:, None]
+        w_dequant = (
+            wq_unpacked.reshape(N, -1, group_size).float() * w_scale.T[..., None]
+            + w_zp.T[..., None]
+        ).reshape(N, K)
+        y_ref = (x_dequant @ w_dequant.T).to(torch.bfloat16)
+
+        torch.testing.assert_close(y_direct, y_ref, atol=8.0e-2, rtol=8.0e-2)
+        torch.testing.assert_close(y_op, y_direct, atol=0.0, rtol=0.0)
+
+
+@skipUnlessRocm()
+class BF16Int4TritonROCmGroupedTests(unittest.TestCase):
+    """
+    Tests for the Triton BF16xINT4 grouped GEMM on AMD GPUs.
+
+    bf16i4bf16_shuffled_grouped is routed through the rowwise kernel on ROCm
+    (the CUTLASS shuffle layout does not exist on AMD).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.device = "cuda"
+
+    @parameterized.expand(
+        [
+            (2, 64, 512, 256, 128),
+            (2, 128, 1024, 512, 128),
+            (4, 64, 512, 256, 128),
+        ]
+    )
+    def test_grouped_accuracy(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+        group_size: int,
+    ) -> None:
+        device = self.device
+        M_sizes = torch.full((G,), M, dtype=torch.int64, device=device)
+        M_total = G * M
+
+        X = torch.randn(M_total, K, dtype=torch.bfloat16, device=device) * 0.1
+
+        wq_list, scale_list, zero_list, w_ref_list = [], [], [], []
+        for _ in range(G):
+            w = torch.randn(N, K, dtype=torch.bfloat16, device=device) * 0.01
+            wq, w_scale, w_zp = int4_row_quantize(w, group_size)
+            wq_list.append(pack_int4(wq).contiguous())
+            scale_list.append(w_scale.contiguous())
+            zero_list.append(w_zp.contiguous())
+            w_ref_list.append(w)
+
+        WQ = torch.stack(wq_list, dim=0)
+        w_scale_group = torch.stack(scale_list, dim=0)
+        w_zero_group = torch.stack(zero_list, dim=0)
+
+        y = torch.ops.mslk.bf16i4bf16_shuffled_grouped(
+            X, WQ, w_scale_group, w_zero_group, M_sizes
+        )
+        self.assertEqual(y.shape, (M_total, N))
+        self.assertEqual(y.dtype, torch.bfloat16)
+
+        x_splits = torch.split(X, M, dim=0)
+        for g in range(G):
+            start, end = g * M, (g + 1) * M
+            y_g = y[start:end]
+            y_ref = (x_splits[g].float() @ w_ref_list[g].float().T).to(torch.bfloat16)
+            torch.testing.assert_close(y_g, y_ref, atol=1.0e-1, rtol=8.0e-2)
+
+
 @skipUnlessCuda()
 @skipUnlessCudaCapability(9, 9)
 class FP8Int4Tests(unittest.TestCase):
@@ -1408,7 +2243,7 @@ class FP8Int4Tests(unittest.TestCase):
             )
 
 
-@skipUnlessCuda()
+@skipUnlessGfxArch("gfx950")
 @skipUnlessCudaCapability(10)
 class MXFP8Tests(unittest.TestCase):
     @classmethod
@@ -1432,7 +2267,6 @@ class MXFP8Tests(unittest.TestCase):
     ) -> None:
         # Simulate 2d-2d grouped gemm in backward pass `grad_weight = grad_output_t @ input`,
         # where we use "K" as the contracting dim which has "G" groups.
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
 
         total_K = K  # Alias for clarity, communicating this consists of several groups along this dim
         input_group_end_offsets = generate_jagged_offs(
@@ -1534,8 +2368,6 @@ class MXFP8Tests(unittest.TestCase):
         N: int,
         K: int,
     ) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
         # Simulate 2d-3d grouped gemm `out = input @ weight.t()`
         # 2D inputs with groups along M, 3D weights.
         block_size = 32
@@ -1623,7 +2455,6 @@ class MXFP8Tests(unittest.TestCase):
         1. Output with hint matches output without hint (same GEMM, different tile)
         2. Output matches bf16 reference
         """
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
 
         block_size = 32
         actual_total_M = M_per_group * G
@@ -1740,24 +2571,43 @@ class BF16Tests(unittest.TestCase):
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
-    def generate_random_splits(G: int, M: int) -> torch.Tensor:
-        if M > 0:
+    def generate_random_splits(G: int, M: int, min_group_size: int = 1) -> torch.Tensor:
+        device = torch.accelerator.current_accelerator()
+        if M <= 0:
+            return torch.zeros((G,), dtype=torch.int32, device=device)
+
+        if min_group_size <= 1:
             m_cumsums = torch.sort(
                 torch.randint(
                     0,
                     M,
                     (G + 1,),
                     dtype=torch.int32,
-                    device=torch.accelerator.current_accelerator(),
+                    device=device,
                 )
             ).values
             m_cumsums[0], m_cumsums[-1] = 0, M
             m_sizes = m_cumsums[1:] - m_cumsums[:-1]
             return m_sizes
-        else:
-            return torch.zeros(
-                (G,), dtype=torch.int32, device=torch.accelerator.current_accelerator()
-            )
+
+        # Constrained splits: every non-empty group must have at least
+        # `min_group_size` rows (the contract enforced by the ROCm grad/wgrad
+        # Triton kernels). We quantize M into blocks of `min_group_size`,
+        # randomly assign those blocks across groups (groups that receive no
+        # block stay empty, which is allowed), then add the leftover remainder
+        # to the first non-empty group so the sizes still sum to exactly M.
+        num_blocks = M // min_group_size
+        remainder = M - num_blocks * min_group_size
+        block_counts = torch.zeros(G, dtype=torch.int64, device=device)
+        if num_blocks > 0:
+            idx = torch.randint(0, G, (num_blocks,), device=device)
+            block_counts.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.int64))
+        m_sizes = block_counts * min_group_size
+        if remainder > 0:
+            nz = torch.nonzero(m_sizes, as_tuple=False)
+            first = int(nz[0].item()) if nz.numel() > 0 else 0
+            m_sizes[first] += remainder
+        return m_sizes.to(torch.int32)
 
     @parameterized.expand(
         [
@@ -1773,7 +2623,6 @@ class BF16Tests(unittest.TestCase):
             ]
         ]
     )
-    @skipUnlessCuda()
     def test_grouped_gemm_wgrad(
         self,
         G: int,
@@ -1792,7 +2641,8 @@ class BF16Tests(unittest.TestCase):
             (M, K), dtype=dtype, device=torch.accelerator.current_accelerator()
         )
 
-        m_sizes = BF16Tests.generate_random_splits(G, M)
+        # ROCm wgrad kernel requires every non-empty group to have >= 8 rows.
+        m_sizes = BF16Tests.generate_random_splits(G, M, min_group_size=8)
 
         # Test
         if output_accum:
@@ -1881,7 +2731,6 @@ class BF16Tests(unittest.TestCase):
             ]
         ]
     )
-    @skipUnlessCuda()
     def test_grouped_gemm_dgrad(
         self,
         G: int,
@@ -1901,7 +2750,8 @@ class BF16Tests(unittest.TestCase):
             dtype=dtype,
             device=torch.accelerator.current_accelerator(),
         )
-        m_sizes = BF16Tests.generate_random_splits(G, M)
+        # ROCm grad kernel requires every non-empty group to have >= 8 rows.
+        m_sizes = BF16Tests.generate_random_splits(G, M, min_group_size=8)
 
         sm_margin = 0
         num_sms = (
@@ -2166,15 +3016,14 @@ class NVFP4Tests(unittest.TestCase):
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
-        global_scales, a_global_scales, b_global_scales = get_nvfp4_global_scales_naive(
-            [A],
-            [B],
-        )
-        aqs, a_scales = quantize_nvfp4_naive([A], a_global_scales)
-        bqs, b_scales = quantize_nvfp4_naive([B], b_global_scales)
+        a_global_scale = global_scale_nvfp4(A)
+        b_global_scale = global_scale_nvfp4(B)
+        aq, a_scale = triton_quantize_nvfp4(A, a_global_scale)
+        bq, b_scale = triton_quantize_nvfp4(B, b_global_scale)
+        global_scale = torch.reciprocal(a_global_scale * b_global_scale)
 
         out_nvfp4 = torch.ops.mslk.f4f4bf16(
-            aqs[0], bqs[0], a_scales[0], b_scales[0], None, global_scales[0]
+            aq, bq, a_scale, b_scale, None, global_scale
         )
         out_bf16 = A @ B.t()
 
@@ -2205,20 +3054,19 @@ class NVFP4Tests(unittest.TestCase):
         ]
         offsets = torch.arange(M, G * (M + 1), M, dtype=torch.int32, device=self.device)
 
-        global_scales, x_global_scales, w_global_scales = get_nvfp4_global_scales_naive(
-            XS, WS
-        )
-        xqs, x_scales = quantize_nvfp4_naive(XS, x_global_scales)
-        wqs, w_scales = quantize_nvfp4_naive(WS, w_global_scales)
-
-        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)
-        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)
-        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e4m3fn)
-        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e4m3fn)
-        global_scale = torch.stack(global_scales, dim=0)
-
         X = torch.cat(XS, dim=0)
         W = torch.stack(WS, dim=0)
+        m_sizes = torch.full((G,), M, dtype=torch.int64, device=self.device)
+        w_m_sizes = torch.full((G,), N, dtype=torch.int64, device=self.device)
+        x_global_scale, _ = calculate_group_max(X, m_sizes)
+        w_cat = W.reshape(G * N, K)
+        w_global_scale, _ = calculate_group_max(w_cat, w_m_sizes)
+        xq, x_scale = nvfp4_quantize_stacked(m_sizes, X, x_global_scale)
+        wq, w_scale_2d = nvfp4_quantize_stacked(w_m_sizes, w_cat, w_global_scale)
+        wq = wq.view(G, N, K // 2)
+        padded_N = triton.cdiv(N, 128) * 128
+        w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
+        global_scale = torch.reciprocal(x_global_scale * w_global_scale)
 
         out_bf16 = torch._grouped_mm(
             X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
@@ -2255,20 +3103,27 @@ class NVFP4Tests(unittest.TestCase):
         ]
         offsets = torch.arange(K, G * (K + 1), K, dtype=torch.int32, device=self.device)
 
-        global_scales, x_global_scales, w_global_scales = get_nvfp4_global_scales_naive(
-            XS, WS
-        )
-        xqs, x_scales = quantize_nvfp4_naive(XS, x_global_scales)
-        wqs, w_scales = quantize_nvfp4_naive(WS, w_global_scales)
-
-        xq = torch.cat(xqs, dim=1).view(torch.float4_e2m1fn_x2)
-        wq = torch.cat(wqs, dim=1).view(torch.float4_e2m1fn_x2)
-        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e4m3fn)
-        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e4m3fn)
-        global_scale = torch.stack(global_scales, dim=0)
-
         X = torch.cat(XS, dim=1)
         W = torch.cat(WS, dim=1)
+        x_stacked = torch.cat(XS, dim=0)
+        w_stacked = torch.cat(WS, dim=0)
+        x_m_sizes = torch.full((G,), M, dtype=torch.int64, device=self.device)
+        w_m_sizes = torch.full((G,), N, dtype=torch.int64, device=self.device)
+        x_global_scale, _ = calculate_group_max(x_stacked, x_m_sizes)
+        w_global_scale, _ = calculate_group_max(w_stacked, w_m_sizes)
+        xq_stacked, x_scale_2d = nvfp4_quantize_stacked(
+            x_m_sizes, x_stacked, x_global_scale
+        )
+        wq_stacked, w_scale_2d = nvfp4_quantize_stacked(
+            w_m_sizes, w_stacked, w_global_scale
+        )
+        xq = xq_stacked.view(G, M, K // 2).transpose(0, 1).reshape(M, G * K // 2)
+        wq = wq_stacked.view(G, N, K // 2).transpose(0, 1).reshape(N, G * K // 2)
+        padded_M = triton.cdiv(M, 128) * 128
+        padded_N = triton.cdiv(N, 128) * 128
+        x_scale = x_scale_2d[: G * padded_M].view(G, padded_M, -1)
+        w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
+        global_scale = torch.reciprocal(x_global_scale * w_global_scale)
 
         out_bf16 = torch._grouped_mm(
             X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
@@ -2303,7 +3158,7 @@ class NVFP4Tests(unittest.TestCase):
             w_global_scale,
         )
         wq = wq.view(G, N, K // 2)
-        padded_N = ((N + 127) // 128) * 128
+        padded_N = triton.cdiv(N, 128) * 128
         w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
         w_global_scale_inv = torch.reciprocal(w_global_scale)
 
@@ -2377,6 +3232,10 @@ class MXFP4Tests(unittest.TestCase):
             (1, 256, 2048),  # small
             (250, 512, 2048),  # medium
             (250, 1024, 3584),  # large
+            # K not a multiple of the kernels' K tiles (128/256): the K tail
+            # must be masked rather than read past the end of each row.
+            (33, 160, 192),
+            (100, 1024, 2080),
         ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
@@ -2777,13 +3636,11 @@ class MX8MX4Tests(unittest.TestCase):
         ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
         # Quantize A to MX8 with blocked scale layout
-        (a_scale_raw, aq) = to_mxfp8(A)
+        a_scale_raw, aq = to_mxfp8(A)
         a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
             torch.uint8
         )
@@ -2817,8 +3674,6 @@ class MX8MX4Tests(unittest.TestCase):
         N: int,
         K: int,
     ) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
         XS = [
             torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
             for _ in range(G)
@@ -2870,8 +3725,6 @@ class MX8MX4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mx8mx4, out_bf16, atol=6.0e-2, rtol=6.0e-2)
 
     def test_mx8mx4_grouped_gemm_2d_3d_empty_groups(self) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
         G = 8
         N = 1024
         K = 2048
@@ -2938,34 +3791,67 @@ class MX8MX6Tests(unittest.TestCase):
         ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
+        torch.manual_seed(0)
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
-        # Quantize A to MX8 with blocked scale layout
-        (a_scale_raw, aq) = to_mxfp8(A)
+        # MX8 activation with blocked scale layout.
+        a_scale_raw, aq = to_mxfp8(A)
         a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
             torch.uint8
         )
 
-        # Quantize B: use MX8 quantization for scale factors (E8M0 BS32),
-        # then create E2M3 weight data from the MX8 data.
-        # E2M3 is stored as 1 byte per element (6-bit value in uint8).
-        # We use the FP8 data masked to 6 bits as a proxy for E2M3.
-        (b_scale_raw, bq_fp8) = to_mxfp8(B)
+        # MX6 weight: BF16 -> unpacked E2M3 bytes -> bit-packed for the
+        # cutlass 6-bit-stream layout. Scale is E8M0 blocked for TMA.
+        wq_unpacked, b_scale_raw = quantize_bf16_to_mx6_e2m3(B, block_size=32)
+        bq = pack_fp6_e2m3(wq_unpacked)
         b_scale = _to_blocked(b_scale_raw.view(torch.int8).reshape(N, -1)).view(
             torch.uint8
         )
-        bq = bq_fp8.view(torch.uint8) & 0x3F  # mask to 6 bits for E2M3 range
 
         out_mx8mx6 = torch.ops.mslk.mx8mx6bf16(aq, bq, a_scale, b_scale)
+        out_bf16 = A @ B.t()
 
-        # Smoke test: no NaN or Inf
         self.assertFalse(out_mx8mx6.isnan().any().item(), "Output contains NaN")
         self.assertFalse(out_mx8mx6.isinf().any().item(), "Output contains Inf")
-        # Output shape check
         self.assertEqual(out_mx8mx6.shape, (M, N))
+        torch.testing.assert_close(out_mx8mx6, out_bf16, atol=1.0e-1, rtol=1.0e-1)
+
+        ref = out_bf16.float()
+        err = out_mx8mx6.float() - ref
+        mask = ref != 0
+        signal_power = (ref[mask] ** 2).sum()
+        noise_power = (err[mask] ** 2).sum().clamp(min=1e-30)
+        sqnr_db = (10.0 * torch.log10(signal_power / noise_power)).item()
+        self.assertGreater(
+            sqnr_db,
+            20.0,
+            f"mx8mx6 SQNR {sqnr_db:.2f} dB below 20 dB floor (M={M}, N={N}, K={K})",
+        )
+
+    def test_unpacked_weight_raises(self) -> None:
+        """Feeding 1-byte-per-element (unpacked) bytes to mx8mx6bf16 must
+        trip the WQ shape TORCH_CHECK in mx8mx6bf16.cu, not silently produce
+        garbage output."""
+        M, N, K = 64, 256, 2048
+        A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        a_scale_raw, aq = to_mxfp8(A)
+        a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
+            torch.uint8
+        )
+
+        # Unpacked weight: 1 byte per element instead of K*6/8 packed bytes.
+        # Exactly what the old test (and any naive caller) would produce.
+        wq_unpacked, b_scale_raw = quantize_bf16_to_mx6_e2m3(B, block_size=32)
+        b_scale = _to_blocked(b_scale_raw.view(torch.int8).reshape(N, -1)).view(
+            torch.uint8
+        )
+        self.assertEqual(wq_unpacked.shape, (N, K))  # confirm "wrong" shape
+
+        with self.assertRaisesRegex(RuntimeError, "bit-packed 6-bit"):
+            torch.ops.mslk.mx8mx6bf16(aq, wq_unpacked, a_scale, b_scale)
 
 
 @skipUnlessCuda()
@@ -3011,6 +3897,44 @@ class MX6MX6Tests(unittest.TestCase):
         self.assertFalse(out_mx6mx6.isinf().any().item(), "Output contains Inf")
         self.assertEqual(out_mx6mx6.shape, torch.Size([M, N]))
         self.assertEqual(out_mx6mx6.dtype, torch.bfloat16)
+
+    @parameterized.expand(
+        [
+            # K < 32768 so `splits=0` stays on the dense path (the heuristic only
+            # auto-routes K>=32768); forcing `splits>0` exercises CUTLASS split-K
+            # on the same inputs. K divisible by 32*splits.
+            (64, 256, 8192, 4),
+            (64, 256, 8192, 8),
+            (256, 512, 16384, 4),
+        ]
+    )
+    def test_splitk_matches_dense(self, M: int, N: int, K: int, splits: int) -> None:
+        # CUTLASS split-K must match the single-CTA dense path on identical inputs.
+        # Random 6-bit-packed bytes as in test_gemm (no Python MX6 quantizer), so
+        # this is a dense-vs-split-K self-consistency check. The split-K fp32
+        # reduction sums per-chunk partials in a different order than the dense
+        # single-pass accumulation, so results agree only to bf16 tolerance.
+        aq_6 = torch.randint(
+            0, 256, (M, K * 6 // 8), dtype=torch.uint8, device=self.device
+        )
+        bq_6 = torch.randint(
+            0, 256, (N, K * 6 // 8), dtype=torch.uint8, device=self.device
+        )
+        _, a_scale = triton_quantize_mx4_unpack(
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
+        )
+        _, b_scale = triton_quantize_mx4_unpack(
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device)
+        )
+
+        out_dense = torch.ops.mslk.mx6mx6bf16(aq_6, bq_6, a_scale, b_scale, None, 0)
+        out_splitk = torch.ops.mslk.mx6mx6bf16(
+            aq_6, bq_6, a_scale, b_scale, None, splits
+        )
+
+        self.assertFalse(out_splitk.isnan().any().item(), "split-K output has NaN")
+        self.assertEqual(out_splitk.shape, torch.Size([M, N]))
+        torch.testing.assert_close(out_splitk, out_dense, rtol=1.6e-2, atol=1e-2)
 
 
 @skipUnlessGfxArch("gfx942", "gfx950")
@@ -3154,6 +4078,151 @@ class RocmInt8GemmTests(unittest.TestCase):
         ref = self._reference_bf16(XQ, WQ, scale)
         self.assertEqual(out.dtype, torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=1e-2)
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx950")
+@unittest.skipUnless(
+    is_flydsl_version_at_least(),
+    f"requires FlyDSL >= {MIN_FLYDSL_VERSION}, found {flydsl_version()}",
+)
+class FlyDSLPreshuffleGemmTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @parameterized.expand(
+        [
+            (1, 8192, 1024),
+            (32, 1280, 8192),
+            (128, 7424, 8192),
+            (1024, 8192, 1024),
+            (4096, 1280, 8192),
+        ]
+    )
+    def test_gemm(self, M: int, N: int, K: int) -> None:
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        wq_shuffled = flydsl_preshuffle(wq)
+
+        out = flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+
+        ref = (x @ w.T).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
+
+    def test_empty_input(self) -> None:
+        M, N, K = 0, 256, 256
+        x = torch.empty(M, K, dtype=torch.bfloat16, device=self.device)
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        wq_shuffled = flydsl_preshuffle(wq)
+
+        out = flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+
+        ref = (x @ w.T).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref)
+
+    def test_multidimensional_input(self) -> None:
+        M, N, K = 32, 256, 256
+        x = torch.randn(3, M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        wq_shuffled = flydsl_preshuffle(wq)
+
+        out = flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+
+        ref = (x @ w.T).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx950")
+@unittest.skipUnless(
+    is_flydsl_version_at_least(),
+    f"requires FlyDSL >= {MIN_FLYDSL_VERSION}, found {flydsl_version()}",
+)
+class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @parameterized.expand(
+        [
+            # small M (decode)
+            (16, 1, 1280, 8192),
+            (4, 1, 8192, 1024),
+            # medium M
+            (4, 32, 1280, 8192),
+            (8, 64, 8192, 1024),
+            (2, 128, 7424, 8192),
+            # large M (prefill)
+            (2, 1024, 1280, 8192),
+            (2, 4096, 8192, 1024),
+            # B=1 (degenerate batch)
+            (1, 64, 1280, 8192),
+        ]
+    )
+    def test_gemm(self, B: int, M: int, N: int, K: int) -> None:
+        x = torch.randn(B, M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(B, N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        wq_shuffled = torch.stack([flydsl_preshuffle(wq[i]) for i in range(B)])
+
+        out = flydsl_preshuffle_batched_gemm(xq, wq_shuffled, x_scale, w_scale)
+
+        ref = torch.bmm(x, w.transpose(1, 2)).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx942", "gfx950")
+@unittest.skipUnless(
+    is_flydsl_version_at_least(),
+    f"requires FlyDSL >= {MIN_FLYDSL_VERSION}, found {flydsl_version()}",
+)
+class FlyDSLBlockwisePreshuffleGemmTest(unittest.TestCase):
+    """Companion of the blockwise mode in ``test_gemm``: exercises the
+    ``f8f8bf16_blockwise_preshuffle`` op (B pre-swizzled into the MFMA layout)
+    against a pure-torch block-scale reference, including M-tail shapes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @parameterized.expand(
+        [
+            (1, 512, 256),  # M-tail: single row
+            (33, 512, 256),  # M-tail: ragged
+            (256, 128, 256),  # small
+            (2048, 256, 4096),  # skinny K
+            (2048, 2048, 4096),  # medium
+            (4096, 4096, 8192),  # large
+        ]
+    )
+    def test_gemm(self, M: int, K: int, N: int) -> None:
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+        xq, x_scale = quantize_fp8_block(x, 128, 128)
+        wq, w_scale = quantize_fp8_block(
+            w, 128, 128, output_device=torch.device(self.device)
+        )
+
+        out = torch.ops.mslk.f8f8bf16_blockwise_preshuffle(
+            xq, preshuffle_b_mfma(wq), x_scale, w_scale, 128, 128, 128
+        )
+        ref = (x @ w.T).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.3e-1, rtol=1.3e-1)
 
 
 if __name__ == "__main__":

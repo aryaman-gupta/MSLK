@@ -21,6 +21,9 @@ from . import (
     flash,
     flash3,
     flash_mtia,
+    flydsl,
+    flydsl_decoder,
+    flydsl_splitk,
     triton_splitk,
 )
 from .attn_bias import (
@@ -58,6 +61,9 @@ MemoryEfficientAttentionFlashMtiaAttentionOp = (flash_mtia.FwOp, flash_mtia.BwOp
 MemoryEfficientAttentionCkOp = (ck.FwOp, ck.BwOp)
 MemoryEfficientAttentionCkDecoderOp = (ck_decoder.FwOp, ck.BwOp)
 MemoryEfficientAttentionSplitKCkOp = (ck_splitk.FwOp, ck.BwOp)
+MemoryEfficientAttentionFlyDSLOp = (flydsl.FwOp, flydsl.BwOp)
+MemoryEfficientAttentionFlyDSLDecoderOp = (flydsl_decoder.FwOp, ck.BwOp)
+MemoryEfficientAttentionSplitKFlyDSLOp = (flydsl_splitk.FwOp, ck.BwOp)
 MemoryEfficientAttentionCuteFlashAttentionOp = (
     cute_blackwell.FwOp,
     cute_blackwell.BwOp,
@@ -959,6 +965,7 @@ ALL_FW_OPS: List[Type[AttentionFwOpBase]] = [
     flash.FwOp,
     flash_mtia.FwOp,
     flash3.FwOp,
+    flydsl.FwOp,
     triton_splitk.FwOp,
 ]
 
@@ -969,6 +976,8 @@ ALL_BW_OPS: List[Type[AttentionBwOpBase]] = [
     flash_mtia.BwOp,
     flash3.BwOp,
 ]
+if torch.version.hip:
+    ALL_BW_OPS.append(flydsl.BwOp)
 
 __all__ = [
     "AttentionBias",
@@ -981,7 +990,10 @@ __all__ = [
     "MemoryEfficientAttentionFlashMtiaAttentionOp",
     "memory_efficient_attention",
     "MemoryEfficientAttentionCkOp",
+    "MemoryEfficientAttentionFlyDSLDecoderOp",
+    "MemoryEfficientAttentionSplitKFlyDSLOp",
     "MemoryEfficientAttentionCkDecoderOp",
+    "MemoryEfficientAttentionFlyDSLOp",
     "ALL_FW_OPS",
     "ALL_BW_OPS",
     "attn_bias",

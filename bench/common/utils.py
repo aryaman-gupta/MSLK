@@ -11,10 +11,11 @@ import copy
 import os
 import tempfile
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import click
+import numpy as np
 import torch
 import triton  # @manual=//triton:triton
 from torch.profiler import profile, ProfilerActivity  # pyre-ignore
@@ -29,7 +30,6 @@ class BenchOptions:
     quantize_bench to maintain consistent benchmarking behavior.
 
     Attributes:
-        num_iters: Number of iterations to repeat each benchmark for averaging.
         cuda_graph: Whether to use CUDA graphs for benchmarking. CUDA graphs
             reduce kernel launch overhead and provide more accurate measurements
             for GPU-bound workloads.
@@ -45,7 +45,6 @@ class BenchOptions:
         torch_compile: Whether to use torch.compile for applicable operations.
     """
 
-    num_iters: int = 1
     cuda_graph: bool = True
     rotating_buffer: bool = False
     rep_ms: int = 200
@@ -148,6 +147,52 @@ def profiler(
     )
 
 
+@dataclass
+class BenchStatResult:
+    """Statistical summary of N benchmark iterations."""
+
+    median_ms: float = 0.0
+    mean_ms: float = 0.0
+    std_ms: float = 0.0
+    cov_pct: float = 0.0
+    min_ms: float = 0.0
+    max_ms: float = 0.0
+    n: int = 0
+    raw_ms: list[float] = field(default_factory=list)
+
+
+def do_bench_statistical(
+    fn: Callable[..., Any],
+    args: tuple[Any, ...],
+    opts: BenchOptions,
+    n_iterations: int = 5,
+) -> BenchStatResult:
+    """Run the benchmark n_iterations times and return statistical summary.
+
+    Each iteration uses triton's do_bench internally (which itself runs for
+    rep_ms). The distribution across iterations captures run-to-run variance.
+    """
+    results = [do_bench(fn, args, opts) for _ in range(n_iterations)]
+    return summarize_bench_results(results)
+
+
+def summarize_bench_results(results: list[float]) -> BenchStatResult:
+    """Return summary statistics for repeated benchmark measurements."""
+    arr = np.array(results)
+    mean = float(np.mean(arr))
+    std = float(np.std(arr))
+    return BenchStatResult(
+        median_ms=float(np.median(arr)),
+        mean_ms=mean,
+        std_ms=std,
+        cov_pct=(std / mean * 100) if mean > 0 else 0.0,
+        min_ms=float(arr.min()),
+        max_ms=float(arr.max()),
+        n=len(results),
+        raw_ms=results,
+    )
+
+
 def common_bench_options(shape_registry):
     """Apply the common Click options shared across bench scripts.
 
@@ -161,12 +206,6 @@ def common_bench_options(shape_registry):
                 "--output-dir",
                 default="/tmp",
                 help="Directory to save plots and csvs to",
-            ),
-            click.option(
-                "--num-iters",
-                default=1,
-                type=int,
-                help="Number of iterations to repeat each benchmark.",
             ),
             click.option(
                 "--export-csv",
@@ -194,7 +233,10 @@ def common_bench_options(shape_registry):
             click.option(
                 "--shapes",
                 default=None,
-                help=f"Specific model shapes to use, options: {', '.join(shape_registry.keys())}.",
+                help=(
+                    "Specific model shapes to use, options: "
+                    f"{', '.join(shape_registry.keys())}."
+                ),
             ),
             click.option(
                 "--trace",

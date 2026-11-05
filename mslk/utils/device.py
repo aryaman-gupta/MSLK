@@ -20,6 +20,7 @@ feature-support flags), see ``mslk.testing.device``.
 
 import functools
 import logging
+import os
 from collections.abc import Iterable
 
 import torch
@@ -73,6 +74,21 @@ def cuda_version_at_least(major_min: int) -> bool:
     return int(torch.version.cuda.split(".")[0]) >= major_min
 
 
+def rocm_version_at_least(major_min: int, minor_min: int = 0) -> bool:
+    """True on a ROCm build whose HIP runtime version is at least
+    ``(major_min, minor_min)``.
+
+    Parses ``torch.version.hip`` (e.g. ``"7.14.60850"``). Returns ``False`` on CUDA or
+    CPU-only builds.
+    """
+    if torch.version.hip is None:
+        return False
+    parts = torch.version.hip.split(".")
+    major = int(parts[0])
+    minor = int(parts[1]) if len(parts) > 1 else 0
+    return (major, minor) >= (major_min, minor_min)
+
+
 def get_gfx_arch_name() -> str:
     """Return the ROCm ``gcnArchName`` of the current device (e.g. ``gfx942``).
 
@@ -105,6 +121,26 @@ def is_gfx950() -> bool:
     return is_rocm() and gfx_arch_in(["gfx950"])
 
 
+def is_hopper() -> bool:
+    """True on NVIDIA Hopper GPUs (sm_90: H100/H200).
+
+    Requires a CUDA build: gfx90a (MI200-class) ROCm devices also report
+    capability (9, 0), so the capability check alone is not NVIDIA-specific.
+    """
+    return is_cuda() and compute_capability_in(9, 9)
+
+
+# When set to "1" / "true" / "yes", forces MSLK to use AMD fnuz FP8
+# (torch.float8_e4m3fnuz / tl.float8e4b8) even on gfx950 (MI350X), which
+# natively uses OCP FP8 (torch.float8_e4m3fn).  Useful for debugging or when
+# interoperating with code that always produces fnuz tensors.
+_FORCE_FP8_FNUZ: bool = os.getenv("MSLK_ROCM_FORCE_FP8FNUZ_TYPE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
 @functools.lru_cache
 def supports_float8_fnuz(throw_on_hip_incompatibility: bool = True) -> bool:
     """Whether the current device uses the FP8 ``fnuz`` format (ROCm only).
@@ -120,8 +156,11 @@ def supports_float8_fnuz(throw_on_hip_incompatibility: bool = True) -> bool:
         return False
 
     # gfx942 (MI300) reports (9, 4) and gfx950 (MI350) reports (9, 5).
-    if torch.cuda.get_device_capability() >= (9, 4):
-        return True
+    device_capability = torch.cuda.get_device_capability()
+    if device_capability >= (9, 4):
+        if _FORCE_FP8_FNUZ or device_capability == (9, 4):
+            return True
+        return False
 
     msg = f"Unsupported GPU arch: {get_gfx_arch_name()} for FP8"
     if throw_on_hip_incompatibility:

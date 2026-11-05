@@ -54,6 +54,8 @@ prepare_mslk_build () {
 
   (install_triton_pip "${env_name}") || return 1
 
+  (install_flydsl_pip "${env_name}") || return 1
+
   # shellcheck disable=SC2086
   (test_python_import_package "${env_name}" numpy) || return 1
   # shellcheck disable=SC2086
@@ -91,12 +93,10 @@ __configure_mslk_build_nvcc () {
   echo "[BUILD] Looking up CUDA version ..."
   # shellcheck disable=SC2155,SC2086
   local cxx_path=$(conda run ${env_prefix} which c++)
-  # shellcheck disable=SC2155,SC2086
-  local cuda_version=$(conda run ${env_prefix} nvcc --version | sed -n 's/^.*release \([0-9]\+\.[0-9]\+\).*$/\1/p')
-  # shellcheck disable=SC2206
-  local cuda_version_arr=(${cuda_version//./ })
+  __fetch_cuda_version_array "${env_name}" || return 1
 
   # Only NVCC 12+ supports C++20
+  # shellcheck disable=SC2154
   if [[ ${cuda_version_arr[0]} -lt 12 ]]; then
     local cppstd_ver=17
   else
@@ -163,10 +163,14 @@ __configure_mslk_cuda_home () {
     echo "[BUILD] No need to set CUDA_TOOLKIT_ROOT_DIR and CUDAToolkit_ROOT on older CUDA installations ..."
 
   else
-    echo "[BUILD] Setting CUDA_TOOLKIT_ROOT_DIR and CUDAToolkit_ROOT ..."
+    echo "[BUILD] Setting CUDA compiler and toolkit paths ..."
     # shellcheck disable=SC2155,SC2086
     local conda_prefix=$(conda run ${env_prefix} printenv CONDA_PREFIX)
-    local new_cuda_home="${conda_prefix}/targets/${MACHINE_NAME_LC}-linux"
+    local conda_cuda_target="${MACHINE_NAME_LC}"
+    if [[ "${conda_cuda_target}" == "aarch64" || "${conda_cuda_target}" == "arm64" ]]; then
+      conda_cuda_target="sbsa"
+    fi
+    local new_cuda_home="${conda_prefix}/targets/${conda_cuda_target}-linux"
 
     # shellcheck disable=SC2206
     build_args+=(
@@ -179,6 +183,52 @@ __configure_mslk_cuda_home () {
       -DCUDA_TOOLKIT_ROOT_DIR="${new_cuda_home}"
       -DCUDAToolkit_ROOT="${new_cuda_home}"
     )
+
+    if [[ "${BUILD_CUDA_VERSION}" =~ ^cu[0-9]+$ ]]; then
+      echo "[BUILD] Using Nova-provided CUDA compiler for ${BUILD_CUDA_VERSION} ..."
+      return 0
+    fi
+
+    if [[ "${BUILD_CUDA_VERSION}" =~ ^([0-9]+)(\.([0-9]+))?(\.[0-9]+)?$ ]]; then
+      local requested_cuda_major="${BASH_REMATCH[1]}"
+      local requested_cuda_minor="${BASH_REMATCH[3]:-0}"
+    else
+      echo "[BUILD] Invalid BUILD_CUDA_VERSION '${BUILD_CUDA_VERSION:-<unset>}'; expected X, X.Y, X.Y.Z, or cuNNN for Nova builds"
+      return 1
+    fi
+
+    local conda_nvcc="${conda_prefix}/bin/nvcc"
+    if [ ! -x "${conda_nvcc}" ]; then
+      echo "[BUILD] Conda NVCC is missing or not executable: ${conda_nvcc}"
+      return 1
+    fi
+    if [ ! -f "${new_cuda_home}/include/cuda_runtime.h" ]; then
+      echo "[BUILD] Conda CUDA runtime header is missing: ${new_cuda_home}/include/cuda_runtime.h"
+      return 1
+    fi
+
+    local requested_cuda_version="${requested_cuda_major}.${requested_cuda_minor}"
+    __fetch_cuda_version_array "${env_name}" || return 1
+    # shellcheck disable=SC2154
+    local installed_cuda_version="${cuda_version_arr[0]}.${cuda_version_arr[1]}"
+    if [ "${installed_cuda_version}" != "${requested_cuda_version}" ]; then
+      echo "[BUILD] Conda NVCC version ${installed_cuda_version} does not match requested CUDA ${requested_cuda_version}"
+      return 1
+    fi
+
+    # MSLK's setup.py checks CUDA_BIN_PATH before system CUDA installations.
+    # Bind the compiler explicitly while retaining the conda target directory
+    # as the toolkit root for headers and libraries.
+    # shellcheck disable=SC2086
+    print_exec conda env config vars set ${env_prefix} \
+      CUDA_BIN_PATH="${conda_prefix}" \
+      CUDACXX="${conda_nvcc}" || return 1
+    # shellcheck disable=SC2086
+    print_exec conda run ${env_prefix} printenv CUDA_BIN_PATH CUDACXX || return 1
+
+    build_args+=(
+      -DCMAKE_CUDA_COMPILER="${conda_nvcc}"
+    )
   fi
 }
 
@@ -186,7 +236,7 @@ __configure_mslk_build_rocm () {
   local mslk_variant_targets="$1"
 
   # Fetch ROCm version to $rocm_version_arr
-  __fetch_rocm_version_array ${env_name} || return 1
+  __fetch_rocm_version_array "${env_name}" || return 1
 
   # By default, we build for a limited number of target architectures to save on
   # build time.  This list needs to be updated if the CI ROCm machines have
@@ -212,6 +262,7 @@ __configure_mslk_build_rocm () {
   else
     # If BUILD_FROM_NOVA is unset, then we are building from a compute host with
     # sufficient resources, so we can build for more AMD Instinct architectures.
+    # shellcheck disable=SC2154
     if [[ ${rocm_version_arr[0]} -ge 7 ]]; then
       local arch_list="gfx908,gfx90a,gfx942,gfx950"
     else
@@ -317,10 +368,10 @@ __configure_mslk_build_cuda () {
   )
 
   # Explicitly set CUDA_HOME
-  __configure_mslk_cuda_home
+  __configure_mslk_cuda_home || return 1
 
   # Set NVCC flags
-  __configure_mslk_build_nvcc
+  __configure_mslk_build_nvcc || return 1
 }
 
 # shellcheck disable=SC2120
@@ -523,9 +574,11 @@ __build_mslk_common_pre_steps () {
   # shellcheck disable=SC2086
   print_exec conda run --no-capture-output ${env_prefix} python setup.py clean
 
-  echo "[BUILD] Printing git status ..."
-  print_exec git status
-  print_exec git diff
+  if [[ -z "${BUILD_FB_CODE}" || "${BUILD_FB_CODE}" == "0" ]]; then
+    echo "[BUILD] Printing git status ..."
+    print_exec git status
+    print_exec git diff
+  fi
 }
 
 __verify_library_symbols () {
@@ -650,6 +703,12 @@ build_mslk_package () {
   for i in "${!build_args[@]}"; do
     build_args[i]="--config-setting=--build-option=${build_args[i]}"
   done
+
+  # Cap ninja parallelism for the wheel build.
+  if [[ -n "${BUILD_PARALLELISM:-}" && -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
+    export CMAKE_BUILD_PARALLEL_LEVEL="${BUILD_PARALLELISM}"
+  fi
+  echo "[BUILD] CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-<unset: setup.py default applies>} ..."
 
   # Build the wheel.  Invoke using `python -m build`
   #   https://blog.ganssle.io/articles/2021/10/setup-py-deprecated.html

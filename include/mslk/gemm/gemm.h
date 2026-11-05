@@ -147,7 +147,8 @@ at::Tensor f4f4bf16_grouped_stacked(
     at::Tensor M_sizes,
     std::optional<at::Tensor> global_scale = std::nullopt,
     std::optional<at::Tensor> starting_row_after_padding = std::nullopt,
-    bool use_mx = true);
+    bool use_mx = true,
+    int64_t mxfp4_block_size = 32);
 
 at::Tensor bf16x9_gemm(
     at::Tensor A,
@@ -222,6 +223,18 @@ at::Tensor mx8mx4bf16(
 
 // Mixed MX8 x MX6 GEMM using mxf8f6f4 block-scaled tensor core instruction
 // ElementA = mx_float8_t<float_e4m3_t>, ElementB = mx_float6_t<float_e2m3_t>
+//
+// Tensor shape / format contract:
+//   XQ:       [M, K]     uint8 — MX8 (E4M3) bytes, 1 per element
+//   WQ:       [N, K*6/8] uint8 — MX6 (E2M3) BIT-PACKED, 4 unpacked 6-bit
+//             values per 3 packed bytes (LSB-first). See pack_fp6_e2m3()
+//             in mslk/mslk/quantize/mx_mixed_dtype_utils.py.
+//   x_scale:  E8M0 BS32 scales for XQ, _to_blocked swizzled, dtype uint8.
+//   w_scale:  E8M0 BS32 scales for WQ (per *unpacked* element count K),
+//             _to_blocked swizzled, dtype uint8.
+//   output:   [M, N] bfloat16 (optional; allocated if None).
+//
+// Kernel TORCH_CHECKs WQ.size(1)*8 == K*6.
 at::Tensor mx8mx6bf16(
     at::Tensor XQ,
     at::Tensor WQ,
@@ -236,6 +249,9 @@ at::Tensor mx6mx6bf16(
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    std::optional<at::Tensor> output = std::nullopt);
+    std::optional<at::Tensor> output = std::nullopt,
+    // Deep-K split-K control: 0 = heuristic (auto), >0 = force that many
+    // splits.
+    int64_t splits = 0);
 
 } // namespace mslk::gemm

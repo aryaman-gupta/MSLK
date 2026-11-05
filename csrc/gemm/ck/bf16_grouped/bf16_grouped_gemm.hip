@@ -35,6 +35,7 @@ using KernelArguments =
 using ADataType = ck::bhalf_t;
 using BDataType = ck::bhalf_t;
 using CDataType = ck::bhalf_t;
+constexpr int kGroupSetupThreads = 256;
 
 // Define a custom hash function for std::tuple<int, int, int>
 struct IntTupleHash {
@@ -256,9 +257,12 @@ __global__ void set_kernel_args_fixed_nk_kernel(
     int64_t N,
     int64_t K,
     int64_t group_count) {
-  int group_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  // Each thread is responsible for setting up the arguments for one group.
-  if (group_idx < group_count) {
+  const int64_t first_group =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t group_stride =
+      static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t group_idx = first_group; group_idx < group_count;
+       group_idx += group_stride) {
     // Compute offsets for this group.
     int64_t group_M = prepad_M[group_idx];
     KernelArguments kernel_group_args = {
@@ -284,23 +288,22 @@ __global__ void set_kernel_args_m_sizes_kernel(
     BDataType* B,
     CDataType* output,
     int64_t* M_sizes,
-    int64_t M,
+    int64_t* M_offsets,
     int64_t N,
     int64_t K,
     int64_t group_count) {
-  int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  // Each thread is responsible for setting up the arguments for one group.
-  if (thread_idx < group_count) {
+  const int64_t first_group =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t group_stride =
+      static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t group_idx = first_group; group_idx < group_count;
+       group_idx += group_stride) {
     // Get M information for this group.
-    int64_t kernel_M = M_sizes[thread_idx];
-    int64_t offset_M = 0;
-    // Offset is computed by finding the sum of previous group Ms.
-    for (int i = 0; i < thread_idx; i++) {
-      offset_M += M_sizes[i];
-    }
+    int64_t kernel_M = M_sizes[group_idx];
+    int64_t offset_M = M_offsets[group_idx];
     KernelArguments kernel_group_args = {
         A + (offset_M * K),
-        B + (thread_idx * N * K),
+        B + (group_idx * N * K),
         {},
         output + (offset_M * N),
         int(kernel_M),
@@ -311,7 +314,7 @@ __global__ void set_kernel_args_m_sizes_kernel(
         {},
         int(N)};
     // Write kernel args to memory.
-    kernel_args[thread_idx] = kernel_group_args;
+    kernel_args[group_idx] = kernel_group_args;
   }
 }
 
@@ -323,7 +326,7 @@ void set_dynamic_kernel_args(
     at::Tensor zero_start_index_M) {
   // Get current cuda stream.
   auto stream = at::cuda::getCurrentHIPStream().stream();
-  int group_count = A.size(0);
+  int64_t group_count = A.size(0);
   // Confirm M is on the proper device.
   TORCH_CHECK(
       A.device() == zero_start_index_M.device(),
@@ -342,7 +345,7 @@ void set_dynamic_kernel_args(
   int64_t N = B.size(1);
 
   // Launch a kernel that sets kernel argument memory.
-  set_kernel_args_fixed_nk_kernel<<<1, group_count, 0, stream>>>(
+  set_kernel_args_fixed_nk_kernel<<<1, kGroupSetupThreads, 0, stream>>>(
       reinterpret_cast<KernelArguments*>(kernel_args.data_ptr()),
       reinterpret_cast<ADataType*>(A.data_ptr()),
       reinterpret_cast<BDataType*>(B.data_ptr()),
@@ -362,23 +365,23 @@ at::Tensor get_stacked_kernel_args(
   // Get current cuda stream.
   auto stream = at::cuda::getCurrentHIPStream().stream();
 
-  int group_count = M_sizes.size(0);
+  int64_t group_count = M_sizes.size(0);
   // Get space on device for the kernel argument tensor.
   at::Tensor kernel_args = at::empty(
       {static_cast<long>(group_count * sizeof(KernelArguments))},
       A.options().dtype(at::kByte));
 
-  int64_t M = A.size(A.dim() - 2);
   int64_t K = B.size(2);
   int64_t N = B.size(1);
+  at::Tensor M_offsets = at::cumsum(M_sizes, 0) - M_sizes;
 
-  set_kernel_args_m_sizes_kernel<<<1, group_count, 0, stream>>>(
+  set_kernel_args_m_sizes_kernel<<<1, kGroupSetupThreads, 0, stream>>>(
       reinterpret_cast<KernelArguments*>(kernel_args.data_ptr()),
       reinterpret_cast<ADataType*>(A.data_ptr()),
       reinterpret_cast<BDataType*>(B.data_ptr()),
       reinterpret_cast<CDataType*>(Y.data_ptr()),
       reinterpret_cast<int64_t*>(M_sizes.data_ptr()),
-      M,
+      reinterpret_cast<int64_t*>(M_offsets.data_ptr()),
       N,
       K,
       group_count);
@@ -435,9 +438,9 @@ OutputType _bf16bf16bf16_grouped(
     int64_t MaxN = 0;
     int64_t MaxK = 0;
     for (int i = 0; i < group_count; i++) {
-      MaxM = max(MaxM, A[i].size(0));
-      MaxN = max(MaxN, B[i].size(0));
-      MaxK = max(MaxK, A[i].size(1));
+      MaxM = std::max(MaxM, A[i].size(0));
+      MaxN = std::max(MaxN, B[i].size(0));
+      MaxK = std::max(MaxK, A[i].size(1));
     }
     auto selected_kernel = grouped_heuristic_dispatch<at::TensorList, at::Tensor>(group_count, MaxM, MaxN, MaxK);
     Y = selected_kernel(A, B, kernel_args, Y);
@@ -514,9 +517,9 @@ at::Tensor bf16bf16bf16_grouped_dynamic(
   int64_t MaxN = 0;
   int64_t MaxK = 0;
   for (int i = 0; i < group_count; i++) {
-    MaxM = max(MaxM, A[i].size(0));
-    MaxN = max(MaxN, B[i].size(0));
-    MaxK = max(MaxK, A[i].size(1));
+    MaxM = std::max(MaxM, A[i].size(0));
+    MaxN = std::max(MaxN, B[i].size(0));
+    MaxK = std::max(MaxK, A[i].size(1));
   }
   auto selected_kernel = grouped_heuristic_dispatch<at::Tensor, at::Tensor>(group_count, MaxM, MaxN, MaxK);
   // Run kernel to populate output.
@@ -549,6 +552,7 @@ at::Tensor bf16bf16bf16_grouped_stacked(
       "Input XQ must be type bfloat16.");
 
   TORCH_CHECK(W.is_cuda() && W.is_contiguous());
+  TORCH_CHECK(X.device() == W.device(), "X and W must be on the same device.");
   TORCH_CHECK(W.dim() == 3, "Input W must be 3D (G,N,K).");
   TORCH_CHECK(
       W.dtype() == at::kBFloat16,
@@ -556,15 +560,29 @@ at::Tensor bf16bf16bf16_grouped_stacked(
   TORCH_CHECK(
       W.size(1) >= 512 && W.size(2) >= 512,
       "N and K must be at least 512 for grouped gemm. For smaller inputs, consider unrolling.");
+  TORCH_CHECK(
+      K % 64 == 0,
+      "K must be divisible by 64 for the CK grouped GEMM fallback.");
 
   TORCH_CHECK(
       X.device() == M_sizes.device(),
       "M_sizes and inputs must be on the same device.");
   TORCH_CHECK(M_sizes.dtype() == at::kLong, "M_sizes must be int64.");
 
-  // Allocate an empty output array. We will set its values to zero as part
-  // of kernel setup.
-  at::Tensor Y = at::empty({total_M, N}, X.options().dtype(at::kBFloat16));
+  at::Tensor Y;
+  if (out.has_value()) {
+    Y = out.value();
+    TORCH_CHECK(Y.is_cuda(), "out must be a CUDA tensor.");
+    TORCH_CHECK(Y.device() == X.device(), "out and inputs must be on the same device.");
+    TORCH_CHECK(Y.is_contiguous(), "out must be contiguous.");
+    TORCH_CHECK(Y.dtype() == at::kBFloat16, "out must be type bfloat16.");
+    TORCH_CHECK(
+        Y.numel() == total_M * N,
+        "out must contain total_M * N elements.");
+    Y = Y.view({total_M, N});
+  } else {
+    Y = at::empty({total_M, N}, X.options().dtype(at::kBFloat16));
+  }
 
   // Early exit for empty input.
   if (total_M == 0) {
@@ -576,7 +594,7 @@ at::Tensor bf16bf16bf16_grouped_stacked(
 
   auto selected_kernel = grouped_heuristic_dispatch<at::Tensor, at::Tensor>(group_count, total_M, N, K);
 
-  return selected_kernel(X, W, kernel_args, Y);
+  return selected_kernel(X, W, kernel_args, Y).view({total_M, N});
 }
 
 } // namespace mslk::gemm

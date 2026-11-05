@@ -218,7 +218,6 @@ class FwOp(AttentionFwOpBase):
         96,
         128,  # 64x128 kernel
         256,  # 64x128 with accumulation in gmem
-        512,
     ]
 
     @classmethod
@@ -397,7 +396,6 @@ class BwOp(AttentionBwOpBase):
     SUPPORTS_DROPOUT = FwOp.SUPPORTS_DROPOUT
     SUPPORTS_CUSTOM_SCALE = FwOp.SUPPORTS_CUSTOM_SCALE
     SUPPORTS_DIFFERENT_VALUE_EMBED = FwOp.SUPPORTS_DIFFERENT_VALUE_EMBED
-    SUPPORTS_UNPADDED_LSE = True
     NAME = "ckB"
 
     _TEST_K: List[int] = [

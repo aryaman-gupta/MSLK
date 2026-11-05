@@ -23,6 +23,17 @@ from setuptools.command.install import install as PipInstall
 
 _PYTHON_ONLY = os.environ.get("MSLK_PYTHON_ONLY", "0") == "1"
 
+# Single source of truth for the FlyDSL pin, shared with CI.
+_FLYDSL_VERSION_FILE = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "ci", "flydsl_version.txt"
+)
+
+
+def _flydsl_version() -> str:
+    with open(_FLYDSL_VERSION_FILE, encoding="utf-8") as f:
+        return f.read().strip()
+
+
 if _PYTHON_ONLY:
     _setup_fn = setuptools.setup
 else:
@@ -35,12 +46,68 @@ logging.basicConfig(level=logging.INFO)
 
 
 def _detect_build_variant() -> str:
-    """Auto-detect the build variant based on the installed PyTorch."""
+    """Auto-detect the build variant (cpu/cuda/rocm).
+
+    Uses CU_VERSION when set (the CI signal), otherwise introspects the
+    installed PyTorch. Torch is imported lazily so this also works in
+    python-only source installs, where torch is present in the environment
+    but not imported at module load; it degrades to cpu when torch is absent.
+    """
+    cu_version = os.environ.get("CU_VERSION", "")
+    if cu_version.startswith("rocm"):
+        return "rocm"
+    if cu_version.startswith("cu"):
+        return "cuda"
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
     if torch.version.hip is not None:
         return "rocm"
     if torch.version.cuda is not None:
         return "cuda"
     return "cpu"
+
+
+# Conservative host-RAM budget per parallel NVCC job, in GiB.
+_BUILD_GB_PER_NVCC_JOB = 4
+# Absolute cap on default build parallelism: beyond this, extra jobs add
+# little for these huge translation units while risking OOM.
+_BUILD_MAX_PARALLEL_JOBS = 16
+
+
+def _available_memory_gb() -> Optional[float]:
+    """Best-effort host available memory in GiB, or None if unknown."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _default_build_parallel_jobs() -> int:
+    """Default ninja parallelism, bounded by CPU count and host memory."""
+    jobs = (os.cpu_count() or 4) // 2
+    mem_gb = _available_memory_gb()
+    if mem_gb is not None:
+        jobs = min(jobs, int(mem_gb // _BUILD_GB_PER_NVCC_JOB))
+    return max(1, min(jobs, _BUILD_MAX_PARALLEL_JOBS))
+
+
+def _build_parallel_level() -> str:
+    """Resolve CMAKE_BUILD_PARALLEL_LEVEL honoring explicit overrides first.
+
+    Precedence: CMAKE_BUILD_PARALLEL_LEVEL > MAX_JOBS (PyTorch convention) >
+    BUILD_PARALLELISM (MSLK CI scripts) > memory-aware default.
+    """
+    for var in ("CMAKE_BUILD_PARALLEL_LEVEL", "MAX_JOBS", "BUILD_PARALLELISM"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    return str(_default_build_parallel_jobs())
 
 
 @dataclass(frozen=True)
@@ -131,20 +198,14 @@ class MSLKBuild:
         # FB_INTERNAL_BUILD is set in build scripts for internal FBPKG build
         # environments
         return any(
-            [
-                os.environ.get(key) is not None
-                for key in ["FB_INTERNAL_BUILD", "UNIFIED_FBPKG_NAME"]
-            ]
+            os.environ.get(key) is not None
+            for key in ("FB_INTERNAL_BUILD", "UNIFIED_FBPKG_NAME")
         )
 
     def nova_flag(self) -> Optional[int]:
-        if "BUILD_FROM_NOVA" in os.environ:
-            if str(os.getenv("BUILD_FROM_NOVA")) == "0":
-                return 0
-            else:
-                return 1
-        else:
+        if "BUILD_FROM_NOVA" not in os.environ:
             return None
+        return 0 if os.getenv("BUILD_FROM_NOVA") == "0" else 1
 
     def debug_level(self) -> int:
         return int(self.args.debug)
@@ -300,7 +361,11 @@ class MSLKBuild:
             return f"-D_GLIBCXX_USE_CXX11_ABI={value}"
 
         torch_root = os.path.dirname(torch.__file__)
-        os.environ["CMAKE_BUILD_PARALLEL_LEVEL"] = str((os.cpu_count() or 4) // 2)
+        os.environ["CMAKE_BUILD_PARALLEL_LEVEL"] = _build_parallel_level()
+        print(
+            "[SETUP.PY] CMAKE_BUILD_PARALLEL_LEVEL="
+            f"{os.environ['CMAKE_BUILD_PARALLEL_LEVEL']}"
+        )
 
         cmake_args = [
             f"-DCMAKE_PREFIX_PATH={torch_root}",
@@ -328,18 +393,8 @@ class MSLKBuild:
         print(f"[SETUP.PY] Setting the MSLK build target: {self.target()} ...")
         cmake_args.append(f"-DMSLK_BUILD_TARGET={self.target()}")
 
-        # NOTE: The docs variant is a fake variant that is effectively the
-        # cpu variant, but marks __VARIANT__ as "docs" instead of "cpu".
-        #
-        # This minor change lets the library loader know not throw
-        # exceptions on failed load, which is the workaround for a bug in
-        # the Sphinx documentation generation process, see:
-        #
-        #   https://github.com/pytorch/MSLK/pull/3477
-        #   https://github.com/pytorch/MSLK/pull/3717
-        cmake_bvariant = "cpu" if self.variant() == "docs" else self.variant()
-        print(f"[SETUP.PY] Setting the MSLK build variant: {cmake_bvariant} ...")
-        cmake_args.append(f"-DMSLK_BUILD_VARIANT={cmake_bvariant}")
+        print(f"[SETUP.PY] Setting the MSLK build variant: {self.variant()} ...")
+        cmake_args.append(f"-DMSLK_BUILD_VARIANT={self.variant()}")
 
         if self.args.nvml_lib_path:
             cmake_args.append(f"-DNVML_LIB_PATH={self.args.nvml_lib_path}")
@@ -525,31 +580,13 @@ class MSLKInstall(PipInstall):
     """MSLK PIP Install Routines"""
 
     def print_versions(self) -> None:
-        pytorch_version = (
-            subprocess.run(
-                ["python", "-c", "import torch; print(torch.__version__)"],
-                stdout=subprocess.PIPE,
-            )
-            .stdout.decode("utf-8")
-            .strip()
-        )
-
-        cuda_version_declared = (
-            subprocess.run(
-                ["python", "-c", "import torch; print(torch.version.cuda)"],
-                stdout=subprocess.PIPE,
-            )
-            .stdout.decode("utf-8")
-            .strip()
-        )
-
         table = [
             ["", "Version"],
-            ["PyTorch", pytorch_version],
+            ["PyTorch", torch.__version__],
         ]
 
-        if cuda_version_declared != "None":
-            cuda_version = cuda_version_declared.split(".")
+        if torch.version.cuda is not None:
+            cuda_version = torch.version.cuda.split(".")
             cuda_home = CudaUtils.find_cuda(int(cuda_version[0]), int(cuda_version[1]))
 
             actual_cuda_version = (
@@ -563,7 +600,7 @@ class MSLKInstall(PipInstall):
 
             table.extend(
                 [
-                    ["CUDA (Declared by PyTorch)", cuda_version_declared],
+                    ["CUDA (Declared by PyTorch)", torch.version.cuda],
                     ["CUDA (Actual)", actual_cuda_version],
                 ]
             )
@@ -730,12 +767,22 @@ def main(argv: List[str]) -> None:
             "ROCm",
         ],
         packages=packages,
+        # Ship the prebuilt FlyDSL AOT cache (populated at build time) so it
+        # is available at runtime; absent when AOT is not run.
+        package_data={"mslk.flydsl": ["aot_artifacts/*"]},
         install_requires=[
             # Only specify numpy, as specifying torch will auto-install the
             # release version of torch, which is not what we want for the
             # nightly and test packages
             "numpy",
-        ],
+        ]
+        # FlyDSL is a mandatory ROCm-only backend.
+        + (
+            [f"flydsl=={_flydsl_version()}"]
+            if (build.variant() if not _PYTHON_ONLY else _detect_build_variant())
+            == "rocm"
+            else []
+        ),
         extras_require=extras_require,
         # PyPI package information
         classifiers=[

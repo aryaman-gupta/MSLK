@@ -21,6 +21,7 @@ from typing import (
 )
 
 import torch
+from mslk.utils.device import supports_float8_fnuz
 
 from ._triton.available import is_triton_available
 from .attn_bias import (
@@ -200,6 +201,7 @@ class FwOp(AttentionFwOpBase):
     SUPPORTS_BMGHK = True
     SUPPORTS_OUTPUT_DTYPE = True
     SUPPORTS_PARTIAL = True
+    SUPPORTS_QUANTIZED_KV = True
     NAME = "triton_splitKF"
 
     SPLIT_K: Optional[int] = None
@@ -862,6 +864,12 @@ class FwOp(AttentionFwOpBase):
         )
 
         IS_HIP = torch.version.hip is not None
+        # fp8 byte format must match how the KV cache was quantized: gfx942 e4m3fnuz,
+        # gfx950/CUDA e4m3fn. Derive from supports_float8_fnuz (NOT hardcoded per-HIP).
+        if IS_HIP:
+            FP8_FNUZ = supports_float8_fnuz(throw_on_hip_incompatibility=False)
+        else:
+            FP8_FNUZ = False
 
         if inp.quantize_pv_to_fp8:
             v = v.view(torch.int8)
@@ -937,6 +945,7 @@ class FwOp(AttentionFwOpBase):
             HAS_ADDITIVE_BIAS=attn_bias_tensor is not None,
             NUM_PROGRAMS_DIM2_CONST=split_k,
             IS_HIP=IS_HIP,
+            FP8_FNUZ=FP8_FNUZ,
             QUANTIZE_PV_TO_FP8=inp.quantize_pv_to_fp8,
             QUANTIZE_QK_TO_FP8=inp.quantize_qk_to_fp8,
             USE_FP32_SCALES=inp.use_fp32_scales,
@@ -1104,6 +1113,7 @@ def merge_attentions(
         lse_out,
         # pyrefly: ignore [bad-argument-type]
         split_k=split_k,
+        # pyrefly: ignore [bad-argument-type]
         splitK_pow2=splitK_pow2,
         # pyrefly: ignore [bad-argument-type]
         **_strides(attn_split, "osk_z", "osk_g", "osk_h", "osk_s", "osk_m", "osk_k"),
@@ -1115,6 +1125,7 @@ def merge_attentions(
         **_strides(lse_out, "lse_z", "lse_g", "lse_h", "lse_m"),
         # pyrefly: ignore [bad-argument-type]
         head_dim=head_dim,
+        # pyrefly: ignore [bad-argument-type]
         head_dim_pow_2=triton.next_power_of_2(head_dim),
         # pyrefly: ignore [bad-argument-type]
         G=G,

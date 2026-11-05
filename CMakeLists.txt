@@ -123,10 +123,18 @@ include(${CMAKEMODULES}/GpuCppLibrary.cmake)
 # Source Includes
 ################################################################################
 
+# On ROCm, csrc/ and include/ are HIPified in a copy under the build directory
+# so that generated files never land in the source tree
+if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
+  set(MSLK_SRC_DIR ${CMAKE_BINARY_DIR}/hipified)
+else()
+  set(MSLK_SRC_DIR ${MSLK})
+endif()
+
 set(mslk_include_directories
   # MSLK
-  ${MSLK}/include
-  ${MSLK}/csrc/attention/ck/fmha/hip_fmha
+  ${MSLK_SRC_DIR}/include
+  ${MSLK_SRC_DIR}/csrc/attention/ck/fmha/hip_fmha
   # PyTorch
   ${TORCH_INCLUDE_DIRS}
   # Third-party
@@ -136,45 +144,78 @@ set(mslk_include_directories
   ${THIRDPARTY}/composable_kernel/library/include
   ${NCCL_INCLUDE_DIRS})
 
+# The vendored composable_kernel submodule ships `ck/config.h.in` but not the
+# generated `ck/config.h` that `ck/ck.hpp` includes.  ROCm installations provide
+# the generated header under ${ROCM_PATH}/include, but toolchains coming from
+# the `rocm-sdk-devel` wheel (e.g. the ROCm 7.14 manylinux builder image) don't.
+#
+# Only the presence of the header matters here: MSLK passes none of CK's
+# `-DCK_USE_*` build flags, and the `CK_USE_{OCP,FNUZ}_FP8` values written by
+# `configure_file()` are the literal token `ON`, which `#if` evaluates to 0.
+if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
+  find_file(CK_CONFIG_H ck/config.h PATHS ${ROCM_PATH}/include NO_DEFAULT_PATH)
+
+  if(NOT CK_CONFIG_H)
+    message(STATUS "generating ck/config.h")
+    set(CK_ENABLE_ALL_DTYPES "ON")
+    configure_file(
+      ${THIRDPARTY}/composable_kernel/include/ck/config.h.in
+      ${CMAKE_BINARY_DIR}/ck_config/ck/config.h
+      @ONLY)
+    list(APPEND mslk_include_directories ${CMAKE_BINARY_DIR}/ck_config)
+  endif()
+endif()
+
 
 ################################################################################
 # HIP Code Generation
 ################################################################################
 
 if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
-  set(include_dirs_for_hipification
-    # All directories need to be included for headers to be properly HIPified
-    ${MSLK}/include
-    ${MSLK}/csrc)
+  # Re-run configure (and so re-copy and re-HIPify) whenever a file under
+  # csrc/ or include/ is edited, added or removed
+  file(GLOB_RECURSE mslk_src_files CONFIGURE_DEPENDS
+    ${MSLK}/csrc/* ${MSLK}/include/*)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${mslk_src_files})
 
-  # HIPify all .CU and .CUH sources under the current directory (`/mslk`)
+  # file(COPY) preserves timestamps and skips unchanged files, so incremental
+  # builds only recompile what changed
+  file(COPY ${MSLK}/csrc ${MSLK}/include DESTINATION ${MSLK_SRC_DIR})
+
+  set(mslk_staged_src_files)
+  foreach(f IN LISTS mslk_src_files)
+    file(RELATIVE_PATH relative_path "${MSLK}" "${f}")
+    list(APPEND mslk_staged_src_files "${MSLK_SRC_DIR}/${relative_path}")
+  endforeach()
+
+  # HIPify all .CU and .CUH sources in the copy
   #
   # Note that .H sources are not automatically HIPified, so if they reference
   # CUDA-specific code, e.g. `#include <c10/cuda/CUDAStream.h>`, they will need
   # to be updated with `#ifdef USE_ROCM` guards.
-  #
-  # Exclude external/ - it contains vendored third-party submodules
-  # (composable_kernel, cutlass, googletest, hipify_torch) that are already
-  # HIP-native or CUDA-agnostic and must not be modified in-place.
   hipify(
     CUDA_SOURCE_DIR
-      ${PROJECT_SOURCE_DIR}
+      ${MSLK_SRC_DIR}
     HEADER_INCLUDE_DIR
-      ${include_dirs_for_hipification}
-    IGNORES
-      ${PROJECT_SOURCE_DIR}/external/*)
+      # All directories need to be included for headers to be properly HIPified
+      ${MSLK_SRC_DIR}/include
+      ${MSLK_SRC_DIR}/csrc)
+
+  # Keep only current sources and their HIPified counterparts, including headers.
+  get_hipified_list("${mslk_staged_src_files}" mslk_hipified_files)
+  file(GLOB_RECURSE mslk_staged_files
+    ${MSLK_SRC_DIR}/csrc/* ${MSLK_SRC_DIR}/include/*)
+  foreach(f IN LISTS mslk_staged_files)
+    if(NOT f IN_LIST mslk_staged_src_files AND NOT f IN_LIST mslk_hipified_files)
+      file(REMOVE "${f}")
+    endif()
+  endforeach()
 
   BLOCK_PRINT(
     "HIPify Sources"
     " "
     "CUDA_SOURCE_DIR:"
-    "${PROJECT_SOURCE_DIR}"
-    " "
-    "HEADER_INCLUDE_DIR:"
-    "${include_dirs_for_hipification}"
-    " "
-    "IGNORES:"
-    "${PROJECT_SOURCE_DIR}/external/*"
+    "${MSLK_SRC_DIR}"
   )
 endif()
 
